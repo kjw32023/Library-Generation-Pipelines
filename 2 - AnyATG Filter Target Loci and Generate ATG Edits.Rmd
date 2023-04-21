@@ -1,0 +1,3830 @@
+---
+title: "2 - AnyATG: Filter Target Loci and Generate ATG Edits"
+author: "Katya Williams"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# 1. Setup
+
+## 1.1 Import necessary libraries
+
+```{r setup}
+# Load any necessary libraries
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(seqinr)
+library(friendlyeval)
+```
+
+## 1.2 Read in top target site candidate dataset
+
+*This script creates 1bp indels or substitutions anywhere after the PAM sequence, so it should only be used with `MMR-responsive_any_target_candidates.csv`*
+
+```{r read-lDS004}
+# read in lDS004 data (from Ann Cirincione)
+top <- read_csv('MMR-responsive_any_target_candidates.csv')
+```
+
+# 2. Filter candidate target sites
+
+## 2.1 Generate truncated target sequences
+
+Create truncated target sequences along with a non-editing RT (modified from Ann's RTs)
+
+```{r oligos}
+# initialize empty vectors
+RT_revert <- vector(length=nrow(top))
+PAM <- vector(length=nrow(top))
+Target <- vector(length=nrow(top))
+coding_seq <- vector(length=nrow(top))
+
+# change 5th nt in RT_revcomp to value of Edited_nt
+for(i in 1:nrow(top)) {
+    # get reverse complement of RT
+    RT_revcomp <- toupper(paste(rev(comp(unlist(strsplit(top$RT_template[i], '')))), collapse=''))
+    # extract PAM sequence from reverse complement RT
+    ## PAM encoded as reverse complement at end of RT sequence (bases 4-6)
+    ## need to change 5th base in reverse complement back to original
+    split <- unlist(strsplit(RT_revcomp, ""))
+    split[5] <- top$Reference_nt[i]
+    RT_revert_rc <- paste(split, collapse='')
+    # generate unedited RT template
+    RT_revert[i] <- toupper(paste(rev(comp(unlist(strsplit(RT_revert_rc, '')))), collapse=''))
+    # generate PAM alone
+    PAM[i] <- toupper(substr(RT_revert_rc, 4, 6))
+    
+    # find the index of the nt immediately after the end of the PAM sequence in the wide target
+    after_start <- unlist(gregexpr(top$Protospacer[i], top$Wide_target_sequence[i], fixed=TRUE)) + 23
+    # find the length of the end of the RT template in the wide target
+    after_endlen <- top$RT_length[i] - 7
+    # substring the wide target nt between the PAM and end of the RT -- these are necessary for full RT binding
+    after_PAM <- substr(top$Wide_target_sequence[i], after_start, after_start + after_endlen)
+    # store the start of the coding sequence (concatenate edited PAM and after_PAM)
+    coding_seq[i] <- paste(toupper(c('ATG', after_PAM)), collapse='')
+    # generate minimal target sequence (protospacer + PAM)
+    Target[i] <- paste(toupper(c(top$Protospacer[i], PAM[i], after_PAM)), collapse='')
+}
+
+# add columns to dataset
+top <- top %>% mutate(RT_revert = RT_revert,
+                      PAM = PAM,
+                      Target = Target,
+                      Start_of_Coding_Seq = coding_seq)
+```
+
+# Removing targets with start codons
+
+## 2.2 Truncated target start codon filtering
+
+Remove targets already containing start codons: otherwise, reporter will be active regardless of editing
+
+**This code identifies start codons in both the forward direction, where the PAM is on the coding (sense) strand, and in the reverse direction, where the PAM is on the non-coding (nonsense) strand.** Reverse-oriented target sequences allow strand invasion away from the reporter sequence and introduce fewer indels into the coding sequence.
+
+```{r valid-targets}
+## forward-oriented edits: look for ATG in target sequence
+## reverse-oriented edits: look for CAT in target sequence (reverse complement of ATG)
+
+# check for start codons in the target seq (protospacer + PAM)
+top <- top %>% mutate(Target_hasATG_f = grepl('ATG', top$Target, fixed = TRUE),
+                      Target_hasATG_r = grepl('CAT', top$Target, fixed = TRUE))
+
+# generate table of only start codon-less targets
+## peg_library_start_f: start codon-less targets in the forward direction
+top200_f <- top %>% 
+    filter(Target_hasATG_f == FALSE)
+## peg_library_start_r: start codon-less targets in the reverse direction
+top200_r <- top %>% 
+    filter(Target_hasATG_r == FALSE)
+
+# which loci have a working target in both the forward and reverse directions?
+loci_both <- intersect(top200_f$Target_Locus, top200_r$Target_Locus)
+length(loci_both)
+# which loci are missing from the forward-facing targets?
+loci_f <- setdiff(top$Target_Locus, top200_f$Target_Locus)
+length(loci_f)
+# which locu are missing from the reverse-facing targets?
+loci_r <- setdiff(top$Target_Locus, top200_r$Target_Locus)
+length(loci_r)
+# which loci are missing from both datasets?
+loci_miss <- intersect(loci_f, loci_r)
+loci_miss
+```
+
+# Finding Editable Sequences
+
+ATG reverse complement is CAT
+
+G/C insertion/substitution: find AT forward, AT reverse (+2/-1nt after index)
+A/T insertion/substitution: find TG forward, CA reverse (-1/+2nt after index)
+T/A insertion: find AG forward, CT reverse (+1/+1nt after index)
+
+T/A substitution: find ANG forward, CNT reverse (+1/+1nt after index)
+
+ANTG/CANT deletion: find ANTG forward, CANT reverse (+1/+2nt after index)
+ATNG/CNAT deletion: find ATNG forward, CNAT reverse (+2/+1nt after index)
+
+```{r edit-site-finding-AT-AT}
+# for each gene, find all indices of instances of AT/AT and store in a list
+AT_inTarget_flist <- gregexpr('AT', top200_f$Target, fixed=TRUE)
+AT_inTarget_rlist <- gregexpr('AT', top200_r$Target, fixed=TRUE)
+AT_inWide_flist <- gregexpr('AT', top200_f$Wide_target_sequence, fixed=TRUE)
+AT_inWide_rlist <- gregexpr('AT', top200_r$Wide_target_sequence, fixed=TRUE)
+
+# remove each vector from the list and store as a string
+AT_inTarget_f <- vector(length=nrow(top200_f))
+AT_inTarget_r <- vector(length=nrow(top200_r))
+AT_inWide_f <- vector(length=nrow(top200_f))
+AT_inWide_r <- vector(length=nrow(top200_r))
+
+for (i in 1:nrow(top200_f)) {
+    AT_inTarget_f[i] <- toString(unlist(AT_inTarget_flist[i]))
+    AT_inWide_f[i] <- toString(unlist(AT_inWide_flist[i]))
+}
+
+for (i in 1:nrow(top200_r)) {
+    AT_inTarget_r[i] <- toString(unlist(AT_inTarget_rlist[i]))
+    AT_inWide_r[i] <- toString(unlist(AT_inWide_rlist[i]))
+}
+```
+
+A/T insertion/substitution: find TG forward, CA reverse (-1/+2nt after index)
+
+```{r edit-site-finding-TG-CA}
+# for each gene, find indices of instances of AT and store in a list
+TG_inTarget_flist <- gregexpr('TG', top200_f$Target, fixed=TRUE)
+CA_inTarget_rlist <- gregexpr('CA', top200_r$Target, fixed=TRUE)
+TG_inWide_flist <- gregexpr('TG', top200_f$Wide_target_sequence, fixed=TRUE)
+CA_inWide_rlist <- gregexpr('CA', top200_r$Wide_target_sequence, fixed=TRUE)
+
+# remove each vector from the list and store as a string
+TG_inTarget_f <- vector(length=nrow(top200_f))
+CA_inTarget_r <- vector(length=nrow(top200_r))
+TG_inWide_f <- vector(length=nrow(top200_f))
+CA_inWide_r <- vector(length=nrow(top200_r))
+
+for (i in 1:nrow(top200_f)) {
+    TG_inTarget_f[i] <- toString(unlist(TG_inTarget_flist[i]))
+    TG_inWide_f[i] <- toString(unlist(TG_inWide_flist[i]))
+}
+
+for (i in 1:nrow(top200_r)) {
+    CA_inTarget_r[i] <- toString(unlist(CA_inTarget_rlist[i]))
+    CA_inWide_r[i] <- toString(unlist(CA_inWide_rlist[i]))
+}
+```
+
+T/A insertion: find AG forward, CT reverse (+1/+1nt after index)
+
+```{r edit-site-finding-AG-CT}
+# for each gene, find indices of instances of AT and store in a list
+AG_inTarget_flist <- gregexpr('AG', top200_f$Target, fixed=TRUE)
+CT_inTarget_rlist <- gregexpr('CT', top200_r$Target, fixed=TRUE)
+AG_inWide_flist <- gregexpr('AG', top200_f$Wide_target_sequence, fixed=TRUE)
+CT_inWide_rlist <- gregexpr('CT', top200_r$Wide_target_sequence, fixed=TRUE)
+
+# remove each vector from the list and store as a string
+AG_inTarget_f <- vector(length=nrow(top200_f))
+CT_inTarget_r <- vector(length=nrow(top200_r))
+AG_inWide_f <- vector(length=nrow(top200_f))
+CT_inWide_r <- vector(length=nrow(top200_r))
+
+for (i in 1:nrow(top200_f)) {
+    AG_inTarget_f[i] <- toString(unlist(AG_inTarget_flist[i]))
+    AG_inWide_f[i] <- toString(unlist(AG_inWide_flist[i]))
+}
+
+for (i in 1:nrow(top200_r)) {
+    CT_inTarget_r[i] <- toString(unlist(CT_inTarget_rlist[i]))
+    CT_inWide_r[i] <- toString(unlist(CT_inWide_rlist[i]))
+}
+```
+
+T/A substitution: find ANG forward, CNT reverse (+1/+1nt after index)
+
+```{r edit-site-finding-ANG-CNT}
+# for each gene, find indices of instances of AT and store in a list
+ANG_inTarget_flist <- gregexpr('A.G', top200_f$Target)
+CNT_inTarget_rlist <- gregexpr('C.T', top200_r$Target)
+ANG_inWide_flist <- gregexpr('A[^T]G', top200_f$Wide_target_sequence)
+CNT_inWide_rlist <- gregexpr('C[^A]T', top200_r$Wide_target_sequence)
+
+# remove each vector from the list and store as a string
+ANG_inTarget_f <- vector(length=nrow(top200_f))
+CNT_inTarget_r <- vector(length=nrow(top200_r))
+ANG_inWide_f <- vector(length=nrow(top200_f))
+CNT_inWide_r <- vector(length=nrow(top200_r))
+
+for (i in 1:nrow(top200_f)) {
+    ANG_inTarget_f[i] <- toString(unlist(ANG_inTarget_flist[i]))
+    ANG_inWide_f[i] <- toString(unlist(ANG_inWide_flist[i]))
+}
+
+for (i in 1:nrow(top200_r)) {
+    CNT_inTarget_r[i] <- toString(unlist(CNT_inTarget_rlist[i]))
+    CNT_inWide_r[i] <- toString(unlist(CNT_inWide_rlist[i]))
+}
+```
+
+ANTG/CANT deletion: find ANTG forward, CANT reverse (+1/+2nt after index)
+
+```{r edit-site-finding-ANTG-CANT}
+# for each gene, find indices of instances of AT and store in a list
+ANTG_inTarget_flist <- gregexpr('A.TG', top200_f$Target)
+CANT_inTarget_rlist <- gregexpr('CA.T', top200_r$Target)
+ANTG_inWide_flist <- gregexpr('A.TG', top200_f$Wide_target_sequence)
+CANT_inWide_rlist <- gregexpr('CA.T', top200_r$Wide_target_sequence)
+
+# remove each vector from the list and store as a string
+ANTG_inTarget_f <- vector(length=nrow(top200_f))
+CANT_inTarget_r <- vector(length=nrow(top200_r))
+ANTG_inWide_f <- vector(length=nrow(top200_f))
+CANT_inWide_r <- vector(length=nrow(top200_r))
+
+for (i in 1:nrow(top200_f)) {
+    ANTG_inTarget_f[i] <- toString(unlist(ANTG_inTarget_flist[i]))
+    ANTG_inWide_f[i] <- toString(unlist(ANTG_inWide_flist[i]))
+}
+
+for (i in 1:nrow(top200_r)) {
+    CANT_inTarget_r[i] <- toString(unlist(CANT_inTarget_rlist[i]))
+    CANT_inWide_r[i] <- toString(unlist(CANT_inWide_rlist[i]))
+}
+```
+
+ATNG/CNAT deletion: find ATNG forward, CNAT reverse (+2/+1nt after index)
+
+```{r edit-site-finding-ATNG-CNAT}
+# for each gene, find indices of instances of AT and store in a list
+ATNG_inTarget_flist <- gregexpr('AT.G', top200_f$Target, fixed=TRUE)
+CNAT_inTarget_rlist <- gregexpr('C.AT', top200_r$Target, fixed=TRUE)
+ATNG_inWide_flist <- gregexpr('AT.G', top200_f$Wide_target_sequence, fixed=TRUE)
+CNAT_inWide_rlist <- gregexpr('C.AT', top200_r$Wide_target_sequence, fixed=TRUE)
+
+# remove each vector from the list and store as a string
+ATNG_inTarget_f <- vector(length=nrow(top200_f))
+CNAT_inTarget_r <- vector(length=nrow(top200_r))
+ATNG_inWide_f <- vector(length=nrow(top200_f))
+CNAT_inWide_r <- vector(length=nrow(top200_r))
+
+for (i in 1:nrow(top200_f)) {
+    ATNG_inTarget_f[i] <- toString(unlist(ATNG_inTarget_flist[i]))
+    ATNG_inWide_f[i] <- toString(unlist(ATNG_inWide_flist[i]))
+}
+
+for (i in 1:nrow(top200_r)) {
+    CNAT_inTarget_r[i] <- toString(unlist(CNAT_inTarget_rlist[i]))
+    CNAT_inWide_r[i] <- toString(unlist(CNAT_inWide_rlist[i]))
+}
+```
+
+```{r add-cols}
+# add as a column to the dataset
+top200_f <- top200_f %>% mutate(AT_inTarget = AT_inTarget_f,
+                                AT_inWide = AT_inWide_f,
+                                TG_inTarget = TG_inTarget_f,
+                                TG_inWide = TG_inWide_f,
+                                AG_inTarget = AG_inTarget_f,
+                                AG_inWide = AG_inWide_f,
+                                ANG_inTarget = ANG_inTarget_f,
+                                ANG_inWide = ANG_inWide_f,
+                                ANTG_inTarget = ANTG_inTarget_f,
+                                ANTG_inWide = ANTG_inWide_f,
+                                ATNG_inTarget = ATNG_inTarget_f,
+                                ATNG_inWide = ATNG_inWide_f)
+top200_r <- top200_r %>% mutate(AT_inTarget = AT_inTarget_r,
+                                AT_inWide = AT_inWide_r,
+                                CA_inTarget = CA_inTarget_r,
+                                CA_inWide = CA_inWide_r,
+                                CT_inTarget = CT_inTarget_r,
+                                CT_inWide = CT_inWide_r,
+                                CNT_inTarget = CNT_inTarget_r,
+                                CNT_inWide = CNT_inWide_r,
+                                CANT_inTarget = CANT_inTarget_r,
+                                CANT_inWide = CANT_inWide_r,
+                                CNAT_inTarget = CNAT_inTarget_r,
+                                CNAT_inWide = CNAT_inWide_r)
+```
+
+# Identifying Edit Indices
+
+## Insertions
+
+G/C insertion: find AT forward, AT reverse (+2/0nt after index)
+for G insertion after AT: edit index is +2 from given index forward
+for C insertion after AT: edit index is 0 from given index forward
+
+```{r ins-at-AT-AT}
+## editing only occurs downstream of nick 3nt in from PAM
+## edit index must be >= 18
+
+# initialize empty vectors
+fmin <- vector(length=nrow(top200_f))
+fwide <- vector(length=nrow(top200_f))
+rmin <- vector(length=nrow(top200_r))
+rwide <- vector(length=nrow(top200_r))
+
+# store the adjustment from the edit index in its own variable
+fadj <- 2
+radj <- 0
+
+# for AT insertion: edit index is +2 from given index
+# for each minimal and wide forward target:
+for (i in 1:nrow(top200_f)) {
+    # create a vector of the indices from the list of edit indices
+    fmin_asvec <- unlist(AT_inTarget_flist[i])
+    fwide_asvec <- unlist(AT_inWide_flist[i])
+    
+    # adjust to search the editable region
+    #(since values need to be >= 18, -1 for no seq found will be filtered out)
+    fmin_asvec <- fmin_asvec + fadj
+    fwide_asvec <- fwide_asvec + fadj
+    
+    # clear the storage vectors for edit index iteration
+    fmin_edit <- c()
+    fwide_edit <- c()
+    
+    # minimal: if edit index is >= 18, store it in a new vector
+    for(j in 1:length(fmin_asvec)){
+        if (fmin_asvec[j] >= 18) {
+            fmin_edit <- c(fmin_edit, fmin_asvec[j])
+        }
+    }
+    
+    # wide: if edit index is >= 18, store it in a new vector
+    for(j in 1:length(fwide_asvec)){
+        if (fwide_asvec[j] >= 18) {
+            fwide_edit <- c(fwide_edit, fwide_asvec[j])
+        }
+    }
+
+    # if edit index storage vector is empty, fill with 'NA'
+    if (length(fmin_edit) == 0) {
+        fmin_edit <- NA
+    }
+
+    if (length(fwide_edit) == 0) {
+        fwide_edit <- NA
+    }
+    
+    # convert to a character string and store in final vector
+    fmin[i] <- toString(fmin_edit)
+    fwide[i] <- toString(fwide_edit)
+}
+
+# for each minimal and wide reverse target:
+for (i in 1:nrow(top200_r)) {
+    # create a vector of the indices from the list of edit indices
+    rmin_asvec <- unlist(AT_inTarget_rlist[i])
+    rwide_asvec <- unlist(AT_inWide_rlist[i])
+    
+    # adjust to search the editable region
+    #(since values need to be >= 18, -1 for no seq found will be filtered out)
+    rmin_asvec <- rmin_asvec + radj
+    rwide_asvec <- rwide_asvec + radj
+    
+    # clear the storage vectors for edit index iteration
+    rmin_edit <- c()
+    rwide_edit <- c()
+    
+    # minimal: if edit index is >=18, store it in a new vector
+    for(j in 1:length(rmin_asvec)){
+        if (rmin_asvec[j] >= 18) {
+            rmin_edit <- c(rmin_edit, rmin_asvec[j])
+        }
+    }
+    
+    # wide: if edit index is >=18, store it in a new vector
+    for(j in 1:length(rwide_asvec)){
+        if (rwide_asvec[j] >= 18) {
+            rwide_edit <- c(rwide_edit, rwide_asvec[j])
+        }
+    }
+
+    # if edit index storage vector is empty, fill with 'NA'
+    if (length(rmin_edit) == 0) {
+        rmin_edit <- NA
+    }
+
+    if (length(rwide_edit) == 0) {
+        rwide_edit <- NA
+    }
+    
+    # convert to a character string and store in final vector
+    rmin[i] <- toString(rmin_edit)
+    rwide[i] <- toString(rwide_edit)
+}
+
+# store in dataset
+top200_f <- top200_f %>% mutate(G_ins_min = fmin, G_ins_wide = fwide)
+top200_r <- top200_r %>% mutate(C_ins_min = rmin, C_ins_wide = rwide)
+```
+
+A/T insertion: find TG forward, CA reverse (0/+2nt after index)
+for A insertion after TG: edit index is 0 from given index forward
+for T insertion after CA: edit index is +2 from given index forward
+
+```{r A-T-ins}
+## editing only occurs downstream of nick 3nt in from PAM
+## edit index must be >= 18
+
+# store the adjustment from the edit index in its own variable
+fadj <- 0
+radj <- 2
+
+# clear the final vectors
+fmin <- vector(length=nrow(top200_f))
+fwide <- vector(length=nrow(top200_f))
+rmin <- vector(length=nrow(top200_r))
+rwide <- vector(length=nrow(top200_r))
+
+# for TG insertion: edit index is 0 from given index
+# for each minimal and wide forward target:
+for (i in 1:nrow(top200_f)) {
+    # create a vector of the indices from the list of edit indices
+    fmin_asvec <- unlist(TG_inTarget_flist[i])
+    fwide_asvec <- unlist(TG_inWide_flist[i])
+    
+    # adjust to search the editable region
+    #(since values need to be >= 18, -1 for no seq found will be filtered out)
+    fmin_asvec <- fmin_asvec + fadj
+    fwide_asvec <- fwide_asvec + fadj
+    
+    # clear the storage vectors for edit index iteration
+    fmin_edit <- c()
+    fwide_edit <- c()
+    
+    # minimal: if edit index is >= 18, store it in a new vector
+    for(j in 1:length(fmin_asvec)){
+        if (fmin_asvec[j] >= 18) {
+            fmin_edit <- c(fmin_edit, fmin_asvec[j])
+        }
+    }
+    
+    # wide: if edit index is >= 18, store it in a new vector
+    for(j in 1:length(fwide_asvec)){
+        if (fwide_asvec[j] >= 18) {
+            fwide_edit <- c(fwide_edit, fwide_asvec[j])
+        }
+    }
+
+    # if edit index storage vector is empty, fill with 'NA'
+    if (length(fmin_edit) == 0) {
+        fmin_edit <- NA
+    }
+
+    if (length(fwide_edit) == 0) {
+        fwide_edit <- NA
+    }
+    
+    # convert to a character string and store in final vector
+    fmin[i] <- toString(fmin_edit)
+    fwide[i] <- toString(fwide_edit)
+}
+
+# for each minimal and wide reverse target:
+for (i in 1:nrow(top200_r)) {
+    # create a vector of the indices from the list of edit indices
+    rmin_asvec <- unlist(CA_inTarget_rlist[i])
+    rwide_asvec <- unlist(CA_inWide_rlist[i])
+    
+    # adjust to search the editable region
+    #(since values need to be >= 18, -1 for no seq found will be filtered out)
+    rmin_asvec <- rmin_asvec + radj
+    rwide_asvec <- rwide_asvec + radj
+    
+    # clear the storage vectors for edit index iteration
+    rmin_edit <- c()
+    rwide_edit <- c()
+    
+    # minimal: if edit index is <= 6, store it in a new vector
+    for(j in 1:length(rmin_asvec)){
+        if (rmin_asvec[j] >= 18) {
+            rmin_edit <- c(rmin_edit, rmin_asvec[j])
+        }
+    }
+    
+    # wide: if edit index is <= 26, store it in a new vector
+    for(j in 1:length(rwide_asvec)){
+        if (rwide_asvec[j] >= 18) {
+            rwide_edit <- c(rwide_edit, rwide_asvec[j])
+        }
+    }
+
+    # if edit index storage vector is empty, fill with 'NA'
+    if (length(rmin_edit) == 0) {
+        rmin_edit <- NA
+    }
+
+    if (length(rwide_edit) == 0) {
+        rwide_edit <- NA
+    }
+    
+    # convert to a character string and store in final vector
+    rmin[i] <- toString(rmin_edit)
+    rwide[i] <- toString(rwide_edit)
+}
+
+# store in dataset
+top200_f <- top200_f %>% mutate(A_ins_min = fmin, A_ins_wide = fwide)
+top200_r <- top200_r %>% mutate(T_ins_min = rmin, T_ins_wide = rwide)
+```
+
+T/A insertion: find AG forward, CT reverse (+1/+1nt after index)
+for T insertion after AG: edit index is +1 from given index forward
+for A insertion after CT: edit index is +1 from given index forward
+
+```{r T-A-ins}
+## editing only occurs downstream of nick 3nt in from PAM
+## edit index must be >= 18
+
+# store the adjustment from the edit index in its own variable
+fadj <- 1
+radj <- 1
+
+# clear the final vectors
+fmin <- vector(length=nrow(top200_f))
+fwide <- vector(length=nrow(top200_f))
+rmin <- vector(length=nrow(top200_r))
+rwide <- vector(length=nrow(top200_r))
+
+# for AG insertion: edit index is +1 from given index
+# for each minimal and wide forward target:
+for (i in 1:nrow(top200_f)) {
+    # create a vector of the indices from the list of edit indices
+    fmin_asvec <- unlist(AG_inTarget_flist[i])
+    fwide_asvec <- unlist(AG_inWide_flist[i])
+    
+    # adjust to search the editable region
+    #(since values need to be >= 18, -1 for no seq found will be filtered out)
+    fmin_asvec <- fmin_asvec + fadj
+    fwide_asvec <- fwide_asvec + fadj
+    
+    # clear the storage vectors for edit index iteration
+    fmin_edit <- c()
+    fwide_edit <- c()
+    
+    # minimal: if edit index is >= 18, store it in a new vector
+    for(j in 1:length(fmin_asvec)){
+        if (fmin_asvec[j] >= 18) {
+            fmin_edit <- c(fmin_edit, fmin_asvec[j])
+        }
+    }
+    
+    # wide: if edit index is >= 18, store it in a new vector
+    for(j in 1:length(fwide_asvec)){
+        if (fwide_asvec[j] >= 18) {
+            fwide_edit <- c(fwide_edit, fwide_asvec[j])
+        }
+    }
+
+    # if edit index storage vector is empty, fill with 'NA'
+    if (length(fmin_edit) == 0) {
+        fmin_edit <- NA
+    }
+
+    if (length(fwide_edit) == 0) {
+        fwide_edit <- NA
+    }
+    
+    # convert to a character string and store in final vector
+    fmin[i] <- toString(fmin_edit)
+    fwide[i] <- toString(fwide_edit)
+}
+
+# for each minimal and wide reverse target:
+for (i in 1:nrow(top200_r)) {
+    # create a vector of the indices from the list of edit indices
+    rmin_asvec <- unlist(CT_inTarget_rlist[i])
+    rwide_asvec <- unlist(CT_inWide_rlist[i])
+    
+    # adjust to search the editable region
+    #(since values need to be >= 18, -1 for no seq found will be filtered out)
+    rmin_asvec <- rmin_asvec + radj
+    rwide_asvec <- rwide_asvec + radj
+    
+    # clear the storage vectors for edit index iteration
+    rmin_edit <- c()
+    rwide_edit <- c()
+    
+    # minimal: if edit index is <= 6, store it in a new vector
+    for(j in 1:length(rmin_asvec)){
+        if (rmin_asvec[j] >= 18) {
+            rmin_edit <- c(rmin_edit, rmin_asvec[j])
+        }
+    }
+    
+    # wide: if edit index is <= 26, store it in a new vector
+    for(j in 1:length(rwide_asvec)){
+        if (rwide_asvec[j] >= 18) {
+            rwide_edit <- c(rwide_edit, rwide_asvec[j])
+        }
+    }
+
+    # if edit index storage vector is empty, fill with 'NA'
+    if (length(rmin_edit) == 0) {
+        rmin_edit <- NA
+    }
+
+    if (length(rwide_edit) == 0) {
+        rwide_edit <- NA
+    }
+    
+    # convert to a character string and store in final vector
+    rmin[i] <- toString(rmin_edit)
+    rwide[i] <- toString(rwide_edit)
+}
+
+# store in dataset
+top200_f <- top200_f %>% mutate(T_ins_min = fmin, T_ins_wide = fwide)
+top200_r <- top200_r %>% mutate(A_ins_min = rmin, A_ins_wide = rwide)
+```
+
+## Substitutions
+
+A/T substitution: find TG forward, CA reverse (-1/+2nt after index)
+for A substitution after TG: edit index is -1 from given index forward
+for T substitution after CA: edit index is +2 from given index forward
+
+```{r NTG-sub}
+## editing only occurs downstream of nick 3nt in from PAM
+## edit index must be >= 18
+
+# store the adjustment from the edit index in its own variable
+fadj <- -1
+radj <- 2
+
+# clear the final vectors
+fmin <- vector(length=nrow(top200_f))
+fwide <- vector(length=nrow(top200_f))
+rmin <- vector(length=nrow(top200_r))
+rwide <- vector(length=nrow(top200_r))
+
+# for NTG substitution: edit index is -1 from given index
+# for each minimal and wide forward target:
+for (i in 1:nrow(top200_f)) {
+    # create a vector of the indices from the list of edit indices
+    fmin_asvec <- unlist(TG_inTarget_flist[i])
+    fwide_asvec <- unlist(TG_inWide_flist[i])
+    
+    # adjust to search the editable region
+    #(since values need to be >= 18, -1 for no seq found will be filtered out)
+    fmin_asvec <- fmin_asvec + fadj
+    fwide_asvec <- fwide_asvec + fadj
+    
+    # clear the storage vectors for edit index iteration
+    fmin_edit <- c()
+    fwide_edit <- c()
+    
+    # minimal: if edit index is >= 18, store it in a new vector
+    for(j in 1:length(fmin_asvec)){
+        if (fmin_asvec[j] >= 18) {
+            fmin_edit <- c(fmin_edit, fmin_asvec[j])
+        }
+    }
+    
+    # wide: if edit index is >= 18, store it in a new vector
+    for(j in 1:length(fwide_asvec)){
+        if (fwide_asvec[j] >= 18) {
+            fwide_edit <- c(fwide_edit, fwide_asvec[j])
+        }
+    }
+
+    # if edit index storage vector is empty, fill with 'NA'
+    if (length(fmin_edit) == 0) {
+        fmin_edit <- NA
+    }
+
+    if (length(fwide_edit) == 0) {
+        fwide_edit <- NA
+    }
+    
+    # convert to a character string and store in final vector
+    fmin[i] <- toString(fmin_edit)
+    fwide[i] <- toString(fwide_edit)
+}
+
+# for each minimal and wide reverse target:
+for (i in 1:nrow(top200_r)) {
+    # create a vector of the indices from the list of edit indices
+    rmin_asvec <- unlist(CA_inTarget_rlist[i])
+    rwide_asvec <- unlist(CA_inWide_rlist[i])
+    
+    # adjust to search the editable region
+    #(since values need to be >= 18, -1 for no seq found will be filtered out)
+    rmin_asvec <- rmin_asvec + radj
+    rwide_asvec <- rwide_asvec + radj
+    
+    # clear the storage vectors for edit index iteration
+    rmin_edit <- c()
+    rwide_edit <- c()
+    
+    # minimal: if edit index is >=18, store it in a new vector
+    for(j in 1:length(rmin_asvec)){
+        if (rmin_asvec[j] >= 18) {
+            rmin_edit <- c(rmin_edit, rmin_asvec[j])
+        }
+    }
+    
+    # wide: if edit index is >=18, store it in a new vector
+    for(j in 1:length(rwide_asvec)){
+        if (rwide_asvec[j] >= 18) {
+            rwide_edit <- c(rwide_edit, rwide_asvec[j])
+        }
+    }
+
+    # if edit index storage vector is empty, fill with 'NA'
+    if (length(rmin_edit) == 0) {
+        rmin_edit <- NA
+    }
+
+    if (length(rwide_edit) == 0) {
+        rwide_edit <- NA
+    }
+    
+    # convert to a character string and store in final vector
+    rmin[i] <- toString(rmin_edit)
+    rwide[i] <- toString(rwide_edit)
+}
+
+# store in dataset
+top200_f <- top200_f %>% mutate(A_sub_min = fmin, A_sub_wide = fwide)
+top200_r <- top200_r %>% mutate(T_sub_min = rmin, T_sub_wide = rwide)
+```
+
+G/C substitution: find AT forward, AT reverse (+2/-1nt after index)
+for G substitution after AT: edit index is +2 from given index forward
+for C substitution after AT: edit index is 0 from given index forward
+
+```{r ATN-sub}
+## editing only occurs downstream of nick 3nt in from PAM
+## edit index must be >= 18
+
+# store the adjustment from the edit index in its own variable
+fadj <- 2
+radj <- -1
+
+# initialize empty vectors
+fmin <- vector(length=nrow(top200_f))
+fwide <- vector(length=nrow(top200_f))
+rmin <- vector(length=nrow(top200_r))
+rwide <- vector(length=nrow(top200_r))
+
+# for ATN substitution: edit index is +2 from given index
+# for each minimal and wide forward target:
+for (i in 1:nrow(top200_f)) {
+    # create a vector of the indices from the list of edit indices
+    fmin_asvec <- unlist(AT_inTarget_flist[i])
+    fwide_asvec <- unlist(AT_inWide_flist[i])
+    
+    # adjust to search the editable region
+    #(since values need to be >= 18, -1 for no seq found will be filtered out)
+    fmin_asvec <- fmin_asvec + fadj
+    fwide_asvec <- fwide_asvec + fadj
+    
+    # clear the storage vectors for edit index iteration
+    fmin_edit <- c()
+    fwide_edit <- c()
+    
+    # minimal: if edit index is >= 18, store it in a new vector
+    for(j in 1:length(fmin_asvec)){
+        if (fmin_asvec[j] >= 18) {
+            fmin_edit <- c(fmin_edit, fmin_asvec[j])
+        }
+    }
+    
+    # wide: if edit index is >= 18, store it in a new vector
+    for(j in 1:length(fwide_asvec)){
+        if (fwide_asvec[j] >= 18) {
+            fwide_edit <- c(fwide_edit, fwide_asvec[j])
+        }
+    }
+
+    # if edit index storage vector is empty, fill with 'NA'
+    if (length(fmin_edit) == 0) {
+        fmin_edit <- NA
+    }
+
+    if (length(fwide_edit) == 0) {
+        fwide_edit <- NA
+    }
+    
+    # convert to a character string and store in final vector
+    fmin[i] <- toString(fmin_edit)
+    fwide[i] <- toString(fwide_edit)
+}
+
+# for each minimal and wide reverse target:
+for (i in 1:nrow(top200_r)) {
+    # create a vector of the indices from the list of edit indices
+    rmin_asvec <- unlist(AT_inTarget_rlist[i])
+    rwide_asvec <- unlist(AT_inWide_rlist[i])
+    
+    # adjust to search the editable region
+    #(since values need to be >= 18, -1 for no seq found will be filtered out)
+    rmin_asvec <- rmin_asvec + radj
+    rwide_asvec <- rwide_asvec + radj
+    
+    # clear the storage vectors for edit index iteration
+    rmin_edit <- c()
+    rwide_edit <- c()
+    
+    # minimal: if edit index is >=18, store it in a new vector
+    for(j in 1:length(rmin_asvec)){
+        if (rmin_asvec[j] >= 18) {
+            rmin_edit <- c(rmin_edit, rmin_asvec[j])
+        }
+    }
+    
+    # wide: if edit index is >=18, store it in a new vector
+    for(j in 1:length(rwide_asvec)){
+        if (rwide_asvec[j] >= 18) {
+            rwide_edit <- c(rwide_edit, rwide_asvec[j])
+        }
+    }
+
+    # if edit index storage vector is empty, fill with 'NA'
+    if (length(rmin_edit) == 0) {
+        rmin_edit <- NA
+    }
+
+    if (length(rwide_edit) == 0) {
+        rwide_edit <- NA
+    }
+    
+    # convert to a character string and store in final vector
+    rmin[i] <- toString(rmin_edit)
+    rwide[i] <- toString(rwide_edit)
+}
+
+# store in dataset
+top200_f <- top200_f %>% mutate(G_sub_min = fmin, G_sub_wide = fwide)
+top200_r <- top200_r %>% mutate(C_sub_min = rmin, C_sub_wide = rwide)
+```
+
+T/A substitution: find ANG forward, CNT reverse (+1/+1nt after index)
+for T substitution after ANT: edit index is +1 from given index forward
+for A substitution after CNT: edit index is +1 from given index forward
+
+```{r ANG-sub}
+## editing only occurs downstream of nick 3nt in from PAM
+## edit index must be >= 18
+
+# store the adjustment from the edit index in its own variable
+fadj <- 1
+radj <- 1
+
+# clear the final vectors
+fmin <- vector(length=nrow(top200_f))
+fwide <- vector(length=nrow(top200_f))
+rmin <- vector(length=nrow(top200_r))
+rwide <- vector(length=nrow(top200_r))
+
+# for ANG substitution: edit index is +1 from given index
+# for each minimal and wide forward target:
+for (i in 1:nrow(top200_f)) {
+    # create a vector of the indices from the list of edit indices
+    fmin_asvec <- unlist(ANG_inTarget_flist[i])
+    fwide_asvec <- unlist(ANG_inWide_flist[i])
+    
+    # adjust to search the editable region
+    #(since values need to be >= 18, -1 for no seq found will be filtered out)
+    fmin_asvec <- fmin_asvec + fadj
+    fwide_asvec <- fwide_asvec + fadj
+    
+    # clear the storage vectors for edit index iteration
+    fmin_edit <- c()
+    fwide_edit <- c()
+    
+    # minimal: if edit index is >= 18, store it in a new vector
+    for(j in 1:length(fmin_asvec)){
+        if (fmin_asvec[j] >= 18) {
+            fmin_edit <- c(fmin_edit, fmin_asvec[j])
+        }
+    }
+    
+    # wide: if edit index is >= 18, store it in a new vector
+    for(j in 1:length(fwide_asvec)){
+        if (fwide_asvec[j] >= 18) {
+            fwide_edit <- c(fwide_edit, fwide_asvec[j])
+        }
+    }
+
+    # if edit index storage vector is empty, fill with 'NA'
+    if (length(fmin_edit) == 0) {
+        fmin_edit <- NA
+    }
+
+    if (length(fwide_edit) == 0) {
+        fwide_edit <- NA
+    }
+    
+    # convert to a character string and store in final vector
+    fmin[i] <- toString(fmin_edit)
+    fwide[i] <- toString(fwide_edit)
+}
+
+# for each minimal and wide reverse target:
+for (i in 1:nrow(top200_r)) {
+    # create a vector of the indices from the list of edit indices
+    rmin_asvec <- unlist(CNT_inTarget_rlist[i])
+    rwide_asvec <- unlist(CNT_inWide_rlist[i])
+    
+    # adjust to search the editable region
+    #(since values need to be >= 18, -1 for no seq found will be filtered out)
+    rmin_asvec <- rmin_asvec + radj
+    rwide_asvec <- rwide_asvec + radj
+    
+    # clear the storage vectors for edit index iteration
+    rmin_edit <- c()
+    rwide_edit <- c()
+    
+    # minimal: if edit index is >=18, store it in a new vector
+    for(j in 1:length(rmin_asvec)){
+        if (rmin_asvec[j] >= 18) {
+            rmin_edit <- c(rmin_edit, rmin_asvec[j])
+        }
+    }
+    
+    # wide: if edit index is >=18, store it in a new vector
+    for(j in 1:length(rwide_asvec)){
+        if (rwide_asvec[j] >= 18) {
+            rwide_edit <- c(rwide_edit, rwide_asvec[j])
+        }
+    }
+
+    # if edit index storage vector is empty, fill with 'NA'
+    if (length(rmin_edit) == 0) {
+        rmin_edit <- NA
+    }
+
+    if (length(rwide_edit) == 0) {
+        rwide_edit <- NA
+    }
+    
+    # convert to a character string and store in final vector
+    rmin[i] <- toString(rmin_edit)
+    rwide[i] <- toString(rwide_edit)
+}
+
+# store in dataset
+top200_f <- top200_f %>% mutate(T_sub_min = fmin, T_sub_wide = fwide)
+top200_r <- top200_r %>% mutate(A_sub_min = rmin, A_sub_wide = rwide)
+```
+
+## Deletions
+
+ANTG/CANT deletion: find ANTG forward, CANT reverse (+1/+2nt after index)
+for deletion in ANTG: edit index is +1 from given index forward
+for deletion in CANT: edit index is +2 from given index forward
+
+```{r ANTG-del}
+## editing only occurs downstream of nick 3nt in from PAM
+## edit index must be >= 18
+
+# store the adjustment from the edit index in its own variable
+fadj <- 1
+radj <- 2
+
+# clear the final vectors
+fmin <- vector(length=nrow(top200_f))
+fwide <- vector(length=nrow(top200_f))
+rmin <- vector(length=nrow(top200_r))
+rwide <- vector(length=nrow(top200_r))
+
+# for ANTG deletion: edit index is +1 from given index
+# for each minimal and wide forward target:
+for (i in 1:nrow(top200_f)) {
+    # create a vector of the indices from the list of edit indices
+    fmin_asvec <- unlist(ANTG_inTarget_flist[i])
+    fwide_asvec <- unlist(ANTG_inWide_flist[i])
+    
+    # adjust to search the editable region
+    #(since values need to be >= 18, -1 for no seq found will be filtered out)
+    fmin_asvec <- fmin_asvec + fadj
+    fwide_asvec <- fwide_asvec + fadj
+    
+    # clear the storage vectors for edit index iteration
+    fmin_edit <- c()
+    fwide_edit <- c()
+    
+    # minimal: if edit index is >= 18, store it in a new vector
+    for(j in 1:length(fmin_asvec)){
+        if (fmin_asvec[j] >= 18) {
+            fmin_edit <- c(fmin_edit, fmin_asvec[j])
+        }
+    }
+    
+    # wide: if edit index is >= 18, store it in a new vector
+    for(j in 1:length(fwide_asvec)){
+        if (fwide_asvec[j] >= 18) {
+            fwide_edit <- c(fwide_edit, fwide_asvec[j])
+        }
+    }
+
+    # if edit index storage vector is empty, fill with 'NA'
+    if (length(fmin_edit) == 0) {
+        fmin_edit <- NA
+    }
+
+    if (length(fwide_edit) == 0) {
+        fwide_edit <- NA
+    }
+    
+    # convert to a character string and store in final vector
+    fmin[i] <- toString(fmin_edit)
+    fwide[i] <- toString(fwide_edit)
+}
+
+# for each minimal and wide reverse target:
+for (i in 1:nrow(top200_r)) {
+    # create a vector of the indices from the list of edit indices
+    rmin_asvec <- unlist(CANT_inTarget_rlist[i])
+    rwide_asvec <- unlist(CANT_inWide_rlist[i])
+    
+    # adjust to search the editable region
+    #(since values need to be >= 18, -1 for no seq found will be filtered out)
+    rmin_asvec <- rmin_asvec + radj
+    rwide_asvec <- rwide_asvec + radj
+    
+    # clear the storage vectors for edit index iteration
+    rmin_edit <- c()
+    rwide_edit <- c()
+    
+    # minimal: if edit index is >=18, store it in a new vector
+    for(j in 1:length(rmin_asvec)){
+        if (rmin_asvec[j] >= 18) {
+            rmin_edit <- c(rmin_edit, rmin_asvec[j])
+        }
+    }
+    
+    # wide: if edit index is >=18, store it in a new vector
+    for(j in 1:length(rwide_asvec)){
+        if (rwide_asvec[j] >= 18) {
+            rwide_edit <- c(rwide_edit, rwide_asvec[j])
+        }
+    }
+
+    # if edit index storage vector is empty, fill with 'NA'
+    if (length(rmin_edit) == 0) {
+        rmin_edit <- NA
+    }
+
+    if (length(rwide_edit) == 0) {
+        rwide_edit <- NA
+    }
+    
+    # convert to a character string and store in final vector
+    rmin[i] <- toString(rmin_edit)
+    rwide[i] <- toString(rwide_edit)
+}
+
+# store in dataset
+top200_f <- top200_f %>% mutate(ANTG_del_min = fmin, ANTG_del_wide = fwide)
+top200_r <- top200_r %>% mutate(CANT_del_min = rmin, CANT_del_wide = rwide)
+```
+
+ATNG/CNAT deletion: find ATNG forward, CNAT reverse (+2/+1nt after index)
+for deletion in ATNG: edit index is +2 from given index forward
+for deletion in CNAT: edit index is +1 from given index forward
+
+```{r ATNG-del}
+## editing only occurs downstream of nick 3nt in from PAM
+## edit index must be >= 18
+
+# store the adjustment from the edit index in its own variable
+fadj <- 2
+radj <- 1
+
+# initialize empty vectors
+fmin <- vector(length=nrow(top200_f))
+fwide <- vector(length=nrow(top200_f))
+rmin <- vector(length=nrow(top200_r))
+rwide <- vector(length=nrow(top200_r))
+
+# for ATNG deletion: edit index is +2 from given indexs
+# for each minimal and wide forward target:
+for (i in 1:nrow(top200_f)) {
+    # create a vector of the indices from the list of edit indices
+    fmin_asvec <- unlist(ATNG_inTarget_flist[i])
+    fwide_asvec <- unlist(ATNG_inWide_flist[i])
+    
+    # adjust to search the editable region
+    #(since values need to be >= 18, -1 for no seq found will be filtered out)
+    fmin_asvec <- fmin_asvec + fadj
+    fwide_asvec <- fwide_asvec + fadj
+    
+    # clear the storage vectors for edit index iteration
+    fmin_edit <- c()
+    fwide_edit <- c()
+    
+    # minimal: if edit index is >= 18, store it in a new vector
+    for(j in 1:length(fmin_asvec)){
+        if (fmin_asvec[j] >= 18) {
+            fmin_edit <- c(fmin_edit, fmin_asvec[j])
+        }
+    }
+    
+    # wide: if edit index is >= 18, store it in a new vector
+    for(j in 1:length(fwide_asvec)){
+        if (fwide_asvec[j] >= 18) {
+            fwide_edit <- c(fwide_edit, fwide_asvec[j])
+        }
+    }
+
+    # if edit index storage vector is empty, fill with 'NA'
+    if (length(fmin_edit) == 0) {
+        fmin_edit <- NA
+    }
+
+    if (length(fwide_edit) == 0) {
+        fwide_edit <- NA
+    }
+    
+    # convert to a character string and store in final vector
+    fmin[i] <- toString(fmin_edit)
+    fwide[i] <- toString(fwide_edit)
+}
+
+# for each minimal and wide reverse target:
+for (i in 1:nrow(top200_r)) {
+    # create a vector of the indices from the list of edit indices
+    rmin_asvec <- unlist(CNAT_inTarget_rlist[i])
+    rwide_asvec <- unlist(CNAT_inWide_rlist[i])
+    
+    # adjust to search the editable region
+    #(since values need to be >= 18, -1 for no seq found will be filtered out)
+    rmin_asvec <- rmin_asvec + radj
+    rwide_asvec <- rwide_asvec + radj
+    
+    # clear the storage vectors for edit index iteration
+    rmin_edit <- c()
+    rwide_edit <- c()
+    
+    # minimal: if edit index is >=18, store it in a new vector
+    for(j in 1:length(rmin_asvec)){
+        if (rmin_asvec[j] >= 18) {
+            rmin_edit <- c(rmin_edit, rmin_asvec[j])
+        }
+    }
+    
+    # wide: if edit index is >=18, store it in a new vector
+    for(j in 1:length(rwide_asvec)){
+        if (rwide_asvec[j] >= 18) {
+            rwide_edit <- c(rwide_edit, rwide_asvec[j])
+        }
+    }
+
+    # if edit index storage vector is empty, fill with 'NA'
+    if (length(rmin_edit) == 0) {
+        rmin_edit <- NA
+    }
+
+    if (length(rwide_edit) == 0) {
+        rwide_edit <- NA
+    }
+    
+    # convert to a character string and store in final vector
+    rmin[i] <- toString(rmin_edit)
+    rwide[i] <- toString(rwide_edit)
+}
+
+# store in dataset
+top200_f <- top200_f %>% mutate(ATNG_del_min = fmin, ATNG_del_wide = fwide)
+top200_r <- top200_r %>% mutate(CNAT_del_min = rmin, CNAT_del_wide = rwide)
+```
+
+# Generating edits and RT templates
+
+```{r table-storage-vecs}
+# initialize empty vectors to later use to make a table
+orientation <- c()
+edit_strand <- c()
+edit_type <- c()
+edit_pos <- c()
+ref_nt <- c()
+edited_nt <- c()
+inframe_append_pos <- c()
+inframe_append_nt <- c()
+ann_rt <- c()
+reverted_rt <- c()
+new_rt <- c()
+gene <- c()
+guide <- c()
+pbs <- c()
+min_target <- c()
+wide_target <- c()
+protospacer <- c()
+pct_mlh1 <- c()
+pct_pemax <- c()
+pct_diff <- c()
+peg_ID <- c()
+edit_min <- c()
+edit_wide <- c()
+pbs_length <- c()
+rt_length <- c()
+pbs_gc <- c()
+```
+
+## Insertions
+
+### Forward insertions
+
+G insertions (after AT)
+
+```{r f-G-ins}
+# the insertion-specific variables
+nt <- 'G' # nucleotide to insert/replace
+type <- 'G_ins' # type of edit
+ori <- 'f' # orientation of target seq in reporter
+ref <- '-' # ref nt: in this case, none
+strand <- 'sense' # strand that the edit is introduced on, with respect to the Nluc codon
+
+# make storage vectors for only this edit (to improve speed)
+forientation <- c()
+fedit_strand <- c()
+fedit_type <- c()
+fedit_pos <- c()
+fref_nt <- c()
+fedited_nt <- c()
+finframe_append_pos <- c()
+finframe_append_nt <- c()
+fann_rt <- c()
+freverted_rt <- c()
+fnew_rt <- c()
+fgene <- c()
+fguide <- c()
+fpbs <- c()
+fmin_target <- c()
+fwide_target <- c()
+fprotospacer <- c()
+fpct_mlh1 <- c()
+fpct_pemax <- c()
+fpct_diff <- c()
+fpeg_ID <- c()
+fedit_min <- c()
+fedit_wide <- c()
+fpbs_length <- c()
+frt_length <- c()
+fpbs_gc <- c()
+
+# for each gene in the forward set...
+for (i in 1:nrow(top200_f)) {
+    # parse as numeric vector
+    asvec <- as.numeric(unlist(strsplit(top200_f$G_ins_min[i], ',')))
+    # if first value is not NA,
+    if (is.na(asvec[1]) == FALSE) {
+        # iterate through vector and...
+        for (j in 1:length(asvec)) {
+            # store edit info
+            # gene name
+            gene_name <- top200_f$Gene[i]
+            # orientation: forward
+            forientation <- c(forientation, ori)
+            # edited strand
+            fedit_strand <- c(fedit_strand, strand)
+            # edited NT: G
+            fedited_nt <- c(fedited_nt, nt)
+            # edit type: G ins
+            fedit_type <- c(fedit_type, type)
+            # edit position: number - 17 (number of nt before nick)
+            adj <- asvec[j] - 17
+            fedit_pos <- c(fedit_pos, adj)
+            # reference nt: none
+            fref_nt <- c(fref_nt, ref)
+            
+            # generate character vector from string
+            split <- unlist(strsplit(top200_f$RT_revert[i], ""))
+            
+            # need to insert nt at index of adjusted base
+            split <- append(rev(comp(split)), nt, after = adj-1)
+                
+            # in frame: no need to append after ATG
+            rt_new <- paste0(toupper(rev(comp(split))), collapse='')
+            
+            # store the length of the RT and PBS
+            rtlen <- length(split)
+            pbslen <- top200_f$PBS_length[i]
+            
+            # generate character vectors of the target and wide target sites
+            split_mintar <- unlist(strsplit(top200_f$Target[i], ''))
+            split_widetar <- unlist(strsplit(top200_f$Wide_target_sequence[i], ''))
+            
+            # insert nt at unadjusted index
+            split_mintar <- append(split_mintar, nt, after = asvec[j] - 1)
+            split_widetar <- append(split_widetar, nt, after = asvec[j] - 1)
+            
+            # reconcatenate the sequence into a string
+            edited_mintar <- paste0(toupper(split_mintar), collapse='')
+            edited_widetar <- paste0(toupper(split_widetar), collapse='')
+            
+            # generate unique pegRNA edit ID
+            pegID <- paste0(gene_name, '_', strand, '_', adj, ref, 'to', nt, '_', pbslen, '_', rtlen)
+            
+            # add info to storage vectors gene, guide, PBS, Ann's RT, Ann's reverted RT, minimal target, wide target, protospacer, read pcts
+            fann_rt <- c(fann_rt, top200_f$RT_template[i])
+            freverted_rt <- c(freverted_rt, top200_f$RT_revert[i])
+            fnew_rt <- c(fnew_rt, rt_new)
+            fgene <- c(fgene, gene_name)
+            fguide <- c(fguide, top200_f$Guide[i])
+            fpbs <- c(fpbs, top200_f$PBS_revcomp[i])
+            fmin_target <- c(fmin_target, top200_f$Target[i])
+            fwide_target <- c(fwide_target, top200_f$Wide_target_sequence[i])
+            fprotospacer <- c(fprotospacer, top200_f$Protospacer[i])
+            fpct_mlh1 <- c(fpct_mlh1, top200_f$read_pct_d7_MLH1[i])
+            fpct_pemax <- c(fpct_pemax, top200_f$read_pct_d7_PEmax[i])
+            fpct_diff <- c(fpct_diff, top200_f$mean_diff_pct[i])
+            fpeg_ID <- c(fpeg_ID, pegID)
+            fedit_min <- c(fedit_min, edited_mintar)
+            fedit_wide <- c(fedit_wide, edited_widetar)
+            fpbs_length <- c(fpbs_length, pbslen)
+            frt_length <- c(frt_length, rtlen)
+            fpbs_gc <- c(fpbs_length, top200_f$GC_percent_PBS[i])
+        }
+    }
+}
+
+# how to check for in frame?
+# did/should I have revc of protospacer for reverse?
+
+# store in table creation vectors
+orientation <- c(orientation, forientation)
+edit_strand <- c(edit_strand, fedit_strand)
+edit_type <- c(edit_type, fedit_type)
+edit_pos <- c(edit_pos, fedit_pos)
+ref_nt <- c(ref_nt, fref_nt)
+edited_nt <- c(edited_nt, fedited_nt)
+inframe_append_pos <- c(inframe_append_pos, finframe_append_pos)
+inframe_append_nt <- c(inframe_append_nt, finframe_append_nt)
+ann_rt <- c(ann_rt, fann_rt)
+reverted_rt <- c(reverted_rt, freverted_rt)
+new_rt <- c(new_rt, fnew_rt)
+gene <- c(gene, fgene)
+guide <- c(guide, fguide)
+pbs <- c(pbs, fpbs)
+min_target <- c(min_target, fmin_target)
+wide_target <- c(wide_target, fwide_target)
+protospacer <- c(protospacer, fprotospacer)
+pct_mlh1 <- c(pct_mlh1, fpct_mlh1)
+pct_pemax <- c(pct_pemax, fpct_pemax)
+pct_diff <- c(pct_diff, fpct_diff)
+peg_ID <- c(peg_ID, fpeg_ID)
+edit_min <- c(edit_min, fedit_min)
+edit_wide <- c(edit_wide, fedit_wide)
+pbs_length <- c(pbs_length, fpbs_length)
+rt_length <- c(rt_length, frt_length)
+pbs_gc <- c(pbs_length, fpbs_length)
+```
+
+A insertions (before TG)
+
+```{r f-A-ins}
+# the insertion-specific variables
+nt <- 'A' # nucleotide to insert/replace
+type <- 'A_ins' # type of edit
+ori <- 'f' # orientation of target seq in reporter
+ref <- '-' # ref nt: in this case, none
+strand <- 'sense' # strand that the edit is introduced on, with respect to the Nluc codon
+
+# make storage vectors for only this edit (to improve speed)
+forientation <- c()
+fedit_strand <- c()
+fedit_type <- c()
+fedit_pos <- c()
+fref_nt <- c()
+fedited_nt <- c()
+fann_rt <- c()
+freverted_rt <- c()
+fnew_rt <- c()
+fgene <- c()
+fguide <- c()
+fpbs <- c()
+fmin_target <- c()
+fwide_target <- c()
+fprotospacer <- c()
+fpct_mlh1 <- c()
+fpct_pemax <- c()
+fpct_diff <- c()
+fpeg_ID <- c()
+fedit_min <- c()
+fedit_wide <- c()
+fpbs_length <- c()
+frt_length <- c()
+fpbs_gc <- c()
+
+# for each gene in the forward set...
+for (i in 1:nrow(top200_f)) {
+    # parse as numeric vector
+    asvec <- as.numeric(unlist(strsplit(top200_f$A_ins_min[i], ',')))
+    # if first value is not NA,
+    if (is.na(asvec[1]) == FALSE) {
+        # iterate through vector and...
+        for (j in 1:length(asvec)) {
+            # store edit info
+            # gene name
+            gene_name <- top200_f$Gene[i]
+            # orientation: forward
+            forientation <- c(forientation, ori)
+            # edited strand
+            fedit_strand <- c(fedit_strand, strand)
+            # edited NT: G
+            fedited_nt <- c(fedited_nt, nt)
+            # edit type: G ins
+            fedit_type <- c(fedit_type, type)
+            # edit position: number - 17 (number of nt before nick)
+            adj <- asvec[j] - 17
+            fedit_pos <- c(fedit_pos, adj)
+            # reference nt: none
+            fref_nt <- c(fref_nt, ref)
+            
+            # generate character vector from string
+            split <- unlist(strsplit(top200_f$RT_revert[i], ""))
+            
+            # need to insert nt at index of adjusted base
+            split <- append(rev(comp(split)), nt, after = adj-1)
+                
+            # in frame: no need to append after ATG
+            rt_new <- paste0(toupper(rev(comp(split))), collapse='')
+            
+            # store the length of the RT and PBS
+            rtlen <- length(split)
+            pbslen <- top200_f$PBS_length[i]
+            
+            # generate character vectors of the target and wide target sites
+            split_mintar <- unlist(strsplit(top200_f$Target[i], ''))
+            split_widetar <- unlist(strsplit(top200_f$Wide_target_sequence[i], ''))
+            
+            # insert nt at unadjusted index
+            split_mintar <- append(split_mintar, nt, after = asvec[j] - 1)
+            split_widetar <- append(split_widetar, nt, after = asvec[j] - 1)
+            
+            # reconcatenate the sequence into a string
+            edited_mintar <- paste0(toupper(split_mintar), collapse='')
+            edited_widetar <- paste0(toupper(split_widetar), collapse='')
+            
+            # generate unique pegRNA edit ID
+            pegID <- paste0(gene_name, '_', strand, '_', adj, ref, 'to', nt, '_', pbslen, '_', rtlen)
+            
+            # add info to storage vectors gene, guide, PBS, Ann's RT, Ann's reverted RT, minimal target, wide target, protospacer, read pcts
+            fann_rt <- c(fann_rt, top200_f$RT_template[i])
+            freverted_rt <- c(freverted_rt, top200_f$RT_revert[i])
+            fnew_rt <- c(fnew_rt, rt_new)
+            fgene <- c(fgene, top200_f$Gene[i])
+            fguide <- c(fguide, top200_f$Guide[i])
+            fpbs <- c(fpbs, top200_f$PBS_revcomp[i])
+            fmin_target <- c(fmin_target, top200_f$Target[i])
+            fwide_target <- c(fwide_target, top200_f$Wide_target_sequence[i])
+            fprotospacer <- c(fprotospacer, top200_f$Protospacer[i])
+            fpct_mlh1 <- c(fpct_mlh1, top200_f$read_pct_d7_MLH1[i])
+            fpct_pemax <- c(fpct_pemax, top200_f$read_pct_d7_PEmax[i])
+            fpct_diff <- c(fpct_diff, top200_f$mean_diff_pct[i])
+            fpeg_ID <- c(fpeg_ID, pegID)
+            fedit_min <- c(fedit_min, edited_mintar)
+            fedit_wide <- c(fedit_wide, edited_widetar)
+            fpbs_length <- c(fpbs_length, pbslen)
+            frt_length <- c(frt_length, rtlen)
+            fpbs_gc <- c(fpbs_length, top200_f$GC_percent_PBS[i])
+        }
+    }
+}
+
+# how to check for in frame?
+# did/should I have revc of protospacer for reverse?
+
+# store in table creation vectors
+orientation <- c(orientation, forientation)
+edit_strand <- c(edit_strand, fedit_strand)
+edit_type <- c(edit_type, fedit_type)
+edit_pos <- c(edit_pos, fedit_pos)
+ref_nt <- c(ref_nt, fref_nt)
+edited_nt <- c(edited_nt, fedited_nt)
+inframe_append_pos <- c(inframe_append_pos, finframe_append_pos)
+inframe_append_nt <- c(inframe_append_nt, finframe_append_nt)
+ann_rt <- c(ann_rt, fann_rt)
+reverted_rt <- c(reverted_rt, freverted_rt)
+new_rt <- c(new_rt, fnew_rt)
+gene <- c(gene, fgene)
+guide <- c(guide, fguide)
+pbs <- c(pbs, fpbs)
+min_target <- c(min_target, fmin_target)
+wide_target <- c(wide_target, fwide_target)
+protospacer <- c(protospacer, fprotospacer)
+pct_mlh1 <- c(pct_mlh1, fpct_mlh1)
+pct_pemax <- c(pct_pemax, fpct_pemax)
+pct_diff <- c(pct_diff, fpct_diff)
+peg_ID <- c(peg_ID, fpeg_ID)
+edit_min <- c(edit_min, fedit_min)
+edit_wide <- c(edit_wide, fedit_wide)
+pbs_length <- c(pbs_length, fpbs_length)
+rt_length <- c(rt_length, frt_length)
+pbs_gc <- c(pbs_length, fpbs_length)
+```
+
+T insertions (inside AG)
+
+```{r f-T-ins}
+# the insertion-specific variables
+nt <- 'T' # nucleotide to insert/replace
+type <- 'T_ins' # type of edit
+ori <- 'f' # orientation of target seq in reporter
+ref <- '-' # ref nt: in this case, none
+strand <- 'sense' # strand that the edit is introduced on, with respect to the Nluc codon
+
+# make storage vectors for only this edit (to improve speed)
+forientation <- c()
+fedit_strand <- c()
+fedit_type <- c()
+fedit_pos <- c()
+fref_nt <- c()
+fedited_nt <- c()
+fann_rt <- c()
+freverted_rt <- c()
+fnew_rt <- c()
+fgene <- c()
+fguide <- c()
+fpbs <- c()
+fmin_target <- c()
+fwide_target <- c()
+fprotospacer <- c()
+fpct_mlh1 <- c()
+fpct_pemax <- c()
+fpct_diff <- c()
+fpeg_ID <- c()
+fedit_min <- c()
+fedit_wide <- c()
+fpbs_length <- c()
+frt_length <- c()
+fpbs_gc <- c()
+
+# for each gene in the forward set...
+for (i in 1:nrow(top200_f)) {
+    # parse as numeric vector
+    asvec <- as.numeric(unlist(strsplit(top200_f$T_ins_min[i], ',')))
+    # if first value is not NA,
+    if (is.na(asvec[1]) == FALSE) {
+        # iterate through vector and...
+        for (j in 1:length(asvec)) {
+            # store edit info
+            # gene name
+            gene_name <- top200_f$Gene[i]
+            # orientation: forward
+            forientation <- c(forientation, ori)
+            # edited strand
+            fedit_strand <- c(fedit_strand, strand)
+            # edited NT: G
+            fedited_nt <- c(fedited_nt, nt)
+            # edit type: G ins
+            fedit_type <- c(fedit_type, type)
+            # edit position: number - 17 (number of nt before nick)
+            adj <- asvec[j] - 17
+            fedit_pos <- c(fedit_pos, adj)
+            # reference nt: none
+            fref_nt <- c(fref_nt, ref)
+            
+            # generate character vector from string
+            split <- unlist(strsplit(top200_f$RT_revert[i], ""))
+            
+            # need to insert nt at index of adjusted base
+            split <- append(rev(comp(split)), nt, after = adj-1)
+                
+            # in frame: no need to append after ATG
+            rt_new <- paste0(toupper(rev(comp(split))), collapse='')
+            
+            # store the length of the RT and PBS
+            rtlen <- length(split)
+            pbslen <- top200_f$PBS_length[i]
+            
+            # generate character vectors of the target and wide target sites
+            split_mintar <- unlist(strsplit(top200_f$Target[i], ''))
+            split_widetar <- unlist(strsplit(top200_f$Wide_target_sequence[i], ''))
+            
+            # insert nt at unadjusted index
+            split_mintar <- append(split_mintar, nt, after = asvec[j] - 1)
+            split_widetar <- append(split_widetar, nt, after = asvec[j] - 1)
+            
+            # reconcatenate the sequence into a string
+            edited_mintar <- paste0(toupper(split_mintar), collapse='')
+            edited_widetar <- paste0(toupper(split_widetar), collapse='')
+            
+            # generate unique pegRNA edit ID
+            pegID <- paste0(gene_name, '_', strand, '_', adj, ref, 'to', nt, '_', pbslen, '_', rtlen)
+            
+            # add info to storage vectors gene, guide, PBS, Ann's RT, Ann's reverted RT, minimal target, wide target, protospacer, read pcts
+            fann_rt <- c(fann_rt, top200_f$RT_template[i])
+            freverted_rt <- c(freverted_rt, top200_f$RT_revert[i])
+            fnew_rt <- c(fnew_rt, rt_new)
+            fgene <- c(fgene, top200_f$Gene[i])
+            fguide <- c(fguide, top200_f$Guide[i])
+            fpbs <- c(fpbs, top200_f$PBS_revcomp[i])
+            fmin_target <- c(fmin_target, top200_f$Target[i])
+            fwide_target <- c(fwide_target, top200_f$Wide_target_sequence[i])
+            fprotospacer <- c(fprotospacer, top200_f$Protospacer[i])
+            fpct_mlh1 <- c(fpct_mlh1, top200_f$read_pct_d7_MLH1[i])
+            fpct_pemax <- c(fpct_pemax, top200_f$read_pct_d7_PEmax[i])
+            fpct_diff <- c(fpct_diff, top200_f$mean_diff_pct[i])
+            fpeg_ID <- c(fpeg_ID, pegID)
+            fedit_min <- c(fedit_min, edited_mintar)
+            fedit_wide <- c(fedit_wide, edited_widetar)
+            fpbs_length <- c(fpbs_length, pbslen)
+            frt_length <- c(frt_length, rtlen)
+            fpbs_gc <- c(fpbs_length, top200_f$GC_percent_PBS[i])
+        }
+    }
+}
+
+# how to check for in frame?
+# did/should I have revc of protospacer for reverse?
+
+# store in table creation vectors
+orientation <- c(orientation, forientation)
+edit_strand <- c(edit_strand, fedit_strand)
+edit_type <- c(edit_type, fedit_type)
+edit_pos <- c(edit_pos, fedit_pos)
+ref_nt <- c(ref_nt, fref_nt)
+edited_nt <- c(edited_nt, fedited_nt)
+inframe_append_pos <- c(inframe_append_pos, finframe_append_pos)
+inframe_append_nt <- c(inframe_append_nt, finframe_append_nt)
+ann_rt <- c(ann_rt, fann_rt)
+reverted_rt <- c(reverted_rt, freverted_rt)
+new_rt <- c(new_rt, fnew_rt)
+gene <- c(gene, fgene)
+guide <- c(guide, fguide)
+pbs <- c(pbs, fpbs)
+min_target <- c(min_target, fmin_target)
+wide_target <- c(wide_target, fwide_target)
+protospacer <- c(protospacer, fprotospacer)
+pct_mlh1 <- c(pct_mlh1, fpct_mlh1)
+pct_pemax <- c(pct_pemax, fpct_pemax)
+pct_diff <- c(pct_diff, fpct_diff)
+peg_ID <- c(peg_ID, fpeg_ID)
+edit_min <- c(edit_min, fedit_min)
+edit_wide <- c(edit_wide, fedit_wide)
+pbs_length <- c(pbs_length, fpbs_length)
+rt_length <- c(rt_length, frt_length)
+pbs_gc <- c(pbs_length, fpbs_length)
+```
+
+### Reverse
+
+T insertions (after CA)
+
+```{r r-T-ins}
+# the insertion-specific variables
+nt <- 'T' # nucleotide to insert/replace
+type <- 'T_ins' # type of edit
+ori <- 'r' # orientation of target seq in reporter
+ref <- '-' # ref nt: in this case, none
+strand <- 'nonsense' # strand that the edit is introduced on, with respect to the Nluc codon
+
+# make storage vectors for only this edit (to improve speed)
+forientation <- c()
+fedit_strand <- c()
+fedit_type <- c()
+fedit_pos <- c()
+fref_nt <- c()
+fedited_nt <- c()
+fann_rt <- c()
+freverted_rt <- c()
+fnew_rt <- c()
+fgene <- c()
+fguide <- c()
+fpbs <- c()
+fmin_target <- c()
+fwide_target <- c()
+fprotospacer <- c()
+fpct_mlh1 <- c()
+fpct_pemax <- c()
+fpct_diff <- c()
+fpeg_ID <- c()
+fedit_min <- c()
+fedit_wide <- c()
+fpbs_length <- c()
+frt_length <- c()
+fpbs_gc <- c()
+
+# for each gene in the reverse set...
+for (i in 1:nrow(top200_r)) {
+    # parse as numeric vector
+    asvec <- as.numeric(unlist(strsplit(top200_r$T_ins_min[i], ',')))
+    # if first value is not NA,
+    if (is.na(asvec[1]) == FALSE) {
+        # iterate through vector and...
+        for (j in 1:length(asvec)) {
+            # store edit info
+            # gene name
+            gene_name <- top200_f$Gene[i]
+            # orientation
+            forientation <- c(forientation, ori)
+            # edited strand
+            fedit_strand <- c(fedit_strand, strand)
+            # edited NT
+            fedited_nt <- c(fedited_nt, nt)
+            # edit type
+            fedit_type <- c(fedit_type, type)
+            # edit position: number - 17 (number of nt before nick)
+            adj <- asvec[j] - 17
+            fedit_pos <- c(fedit_pos, adj)
+            # reference nt: none
+            fref_nt <- c(fref_nt, ref)
+            
+            # generate character vector from string
+            split <- unlist(strsplit(top200_r$RT_revert[i], ""))
+            
+            # need to insert nt at index of adjusted base
+            split <- append(rev(comp(split)), nt, after = adj-1)
+                
+            # in frame: no need to append after ATG
+            rt_new <- paste0(toupper(rev(comp(split))), collapse='')
+            
+            # store the length of the RT and PBS
+            rtlen <- length(split)
+            pbslen <- top200_r$PBS_length[i]
+            
+            # generate character vectors of the target and wide target sites
+            split_mintar <- unlist(strsplit(top200_r$Target[i], ''))
+            split_widetar <- unlist(strsplit(top200_r$Wide_target_sequence[i], ''))
+            
+            # insert nt at unadjusted index
+            split_mintar <- append(split_mintar, nt, after = asvec[j] - 1)
+            split_widetar <- append(split_widetar, nt, after = asvec[j] - 1)
+            
+            # reconcatenate the sequence into a string
+            edited_mintar <- paste0(toupper(split_mintar), collapse='')
+            edited_widetar <- paste0(toupper(split_widetar), collapse='')
+            
+            # generate unique pegRNA edit ID
+            pegID <- paste0(gene_name, '_', strand, '_', adj, ref, 'to', nt, '_', pbslen, '_', rtlen)
+            
+            # add info to storage vectors gene, guide, PBS, Ann's RT, Ann's reverted RT, minimal target, wide target, protospacer, read pcts
+            fann_rt <- c(fann_rt, top200_r$RT_template[i])
+            freverted_rt <- c(freverted_rt, top200_r$RT_revert[i])
+            fnew_rt <- c(fnew_rt, rt_new)
+            fgene <- c(fgene, top200_r$Gene[i])
+            fguide <- c(fguide, top200_r$Guide[i])
+            fpbs <- c(fpbs, top200_r$PBS_revcomp[i])
+            fmin_target <- c(fmin_target, top200_r$Target[i])
+            fwide_target <- c(fwide_target, top200_r$Wide_target_sequence[i])
+            fprotospacer <- c(fprotospacer, top200_r$Protospacer[i])
+            fpct_mlh1 <- c(fpct_mlh1, top200_r$read_pct_d7_MLH1[i])
+            fpct_pemax <- c(fpct_pemax, top200_r$read_pct_d7_PEmax[i])
+            fpct_diff <- c(fpct_diff, top200_r$mean_diff_pct[i])
+            fpeg_ID <- c(fpeg_ID, pegID)
+            fedit_min <- c(fedit_min, edited_mintar)
+            fedit_wide <- c(fedit_wide, edited_widetar)
+            fpbs_length <- c(fpbs_length, pbslen)
+            frt_length <- c(frt_length, rtlen)
+            fpbs_gc <- c(fpbs_length, top200_r$GC_percent_PBS[i])
+        }
+    }
+}
+
+# how to check for in frame?
+# did/should I have revc of protospacer for reverse?
+
+# store in table creation vectors
+orientation <- c(orientation, forientation)
+edit_strand <- c(edit_strand, fedit_strand)
+edit_type <- c(edit_type, fedit_type)
+edit_pos <- c(edit_pos, fedit_pos)
+ref_nt <- c(ref_nt, fref_nt)
+edited_nt <- c(edited_nt, fedited_nt)
+inframe_append_pos <- c(inframe_append_pos, finframe_append_pos)
+inframe_append_nt <- c(inframe_append_nt, finframe_append_nt)
+ann_rt <- c(ann_rt, fann_rt)
+reverted_rt <- c(reverted_rt, freverted_rt)
+new_rt <- c(new_rt, fnew_rt)
+gene <- c(gene, fgene)
+guide <- c(guide, fguide)
+pbs <- c(pbs, fpbs)
+min_target <- c(min_target, fmin_target)
+wide_target <- c(wide_target, fwide_target)
+protospacer <- c(protospacer, fprotospacer)
+pct_mlh1 <- c(pct_mlh1, fpct_mlh1)
+pct_pemax <- c(pct_pemax, fpct_pemax)
+pct_diff <- c(pct_diff, fpct_diff)
+peg_ID <- c(peg_ID, fpeg_ID)
+edit_min <- c(edit_min, fedit_min)
+edit_wide <- c(edit_wide, fedit_wide)
+pbs_length <- c(pbs_length, fpbs_length)
+rt_length <- c(rt_length, frt_length)
+pbs_gc <- c(pbs_length, fpbs_length)
+```
+
+C insertions (before AT)
+
+```{r r-C-ins}
+# the insertion-specific variables
+nt <- 'C' # nucleotide to insert/replace
+type <- 'C_ins' # type of edit
+ori <- 'r' # orientation of target seq in reporter
+ref <- '-' # ref nt: in this case, none
+strand <- 'nonsense' # strand that the edit is introduced on, with respect to the Nluc codon
+
+# make storage vectors for only this edit (to improve speed)
+forientation <- c()
+fedit_strand <- c()
+fedit_type <- c()
+fedit_pos <- c()
+fref_nt <- c()
+fedited_nt <- c()
+fann_rt <- c()
+freverted_rt <- c()
+fnew_rt <- c()
+fgene <- c()
+fguide <- c()
+fpbs <- c()
+fmin_target <- c()
+fwide_target <- c()
+fprotospacer <- c()
+fpct_mlh1 <- c()
+fpct_pemax <- c()
+fpct_diff <- c()
+fpeg_ID <- c()
+fedit_min <- c()
+fedit_wide <- c()
+fpbs_length <- c()
+frt_length <- c()
+fpbs_gc <- c()
+
+# for each gene in the reverse set...
+for (i in 1:nrow(top200_r)) {
+    # parse as numeric vector
+    asvec <- as.numeric(unlist(strsplit(top200_r$C_ins_min[i], ',')))
+    # if first value is not NA,
+    if (is.na(asvec[1]) == FALSE) {
+        # iterate through vector and...
+        for (j in 1:length(asvec)) {
+            # store edit info
+            # gene name
+            gene_name <- top200_f$Gene[i]
+            # orientation
+            forientation <- c(forientation, ori)
+            # edited strand
+            fedit_strand <- c(fedit_strand, strand)
+            # edited NT
+            fedited_nt <- c(fedited_nt, nt)
+            # edit type
+            fedit_type <- c(fedit_type, type)
+            # edit position: number - 17 (number of nt before nick)
+            adj <- asvec[j] - 17
+            fedit_pos <- c(fedit_pos, adj)
+            # reference nt: none
+            fref_nt <- c(fref_nt, ref)
+            
+            # generate character vector from string
+            split <- unlist(strsplit(top200_r$RT_revert[i], ""))
+            
+            # need to insert nt at index of adjusted base
+            split <- append(rev(comp(split)), nt, after = adj-1)
+                
+            # in frame: no need to append after ATG
+            rt_new <- paste0(toupper(rev(comp(split))), collapse='')
+            
+            # store the length of the RT and PBS
+            rtlen <- length(split)
+            pbslen <- top200_r$PBS_length[i]
+            
+            # generate character vectors of the target and wide target sites
+            split_mintar <- unlist(strsplit(top200_r$Target[i], ''))
+            split_widetar <- unlist(strsplit(top200_r$Wide_target_sequence[i], ''))
+            
+            # insert nt at unadjusted index
+            split_mintar <- append(split_mintar, nt, after = asvec[j] - 1)
+            split_widetar <- append(split_widetar, nt, after = asvec[j] - 1)
+            
+            # reconcatenate the sequence into a string
+            edited_mintar <- paste0(toupper(split_mintar), collapse='')
+            edited_widetar <- paste0(toupper(split_widetar), collapse='')
+            
+            # generate unique pegRNA edit ID
+            pegID <- paste0(gene_name, '_', strand, '_', adj, ref, 'to', nt, '_', pbslen, '_', rtlen)
+            
+            # add info to storage vectors gene, guide, PBS, Ann's RT, Ann's reverted RT, minimal target, wide target, protospacer, read pcts
+            fann_rt <- c(fann_rt, top200_r$RT_template[i])
+            freverted_rt <- c(freverted_rt, top200_r$RT_revert[i])
+            fnew_rt <- c(fnew_rt, rt_new)
+            fgene <- c(fgene, top200_r$Gene[i])
+            fguide <- c(fguide, top200_r$Guide[i])
+            fpbs <- c(fpbs, top200_r$PBS_revcomp[i])
+            fmin_target <- c(fmin_target, top200_r$Target[i])
+            fwide_target <- c(fwide_target, top200_r$Wide_target_sequence[i])
+            fprotospacer <- c(fprotospacer, top200_r$Protospacer[i])
+            fpct_mlh1 <- c(fpct_mlh1, top200_r$read_pct_d7_MLH1[i])
+            fpct_pemax <- c(fpct_pemax, top200_r$read_pct_d7_PEmax[i])
+            fpct_diff <- c(fpct_diff, top200_r$mean_diff_pct[i])
+            fpeg_ID <- c(fpeg_ID, pegID)
+            fedit_min <- c(fedit_min, edited_mintar)
+            fedit_wide <- c(fedit_wide, edited_widetar)
+            fpbs_length <- c(fpbs_length, pbslen)
+            frt_length <- c(frt_length, rtlen)
+            fpbs_gc <- c(fpbs_length, top200_r$GC_percent_PBS[i])
+        }
+    }
+}
+
+# how to check for in frame?
+# did/should I have revc of protospacer for reverse?
+
+# store in table creation vectors
+orientation <- c(orientation, forientation)
+edit_strand <- c(edit_strand, fedit_strand)
+edit_type <- c(edit_type, fedit_type)
+edit_pos <- c(edit_pos, fedit_pos)
+ref_nt <- c(ref_nt, fref_nt)
+edited_nt <- c(edited_nt, fedited_nt)
+inframe_append_pos <- c(inframe_append_pos, finframe_append_pos)
+inframe_append_nt <- c(inframe_append_nt, finframe_append_nt)
+ann_rt <- c(ann_rt, fann_rt)
+reverted_rt <- c(reverted_rt, freverted_rt)
+new_rt <- c(new_rt, fnew_rt)
+gene <- c(gene, fgene)
+guide <- c(guide, fguide)
+pbs <- c(pbs, fpbs)
+min_target <- c(min_target, fmin_target)
+wide_target <- c(wide_target, fwide_target)
+protospacer <- c(protospacer, fprotospacer)
+pct_mlh1 <- c(pct_mlh1, fpct_mlh1)
+pct_pemax <- c(pct_pemax, fpct_pemax)
+pct_diff <- c(pct_diff, fpct_diff)
+peg_ID <- c(peg_ID, fpeg_ID)
+edit_min <- c(edit_min, fedit_min)
+edit_wide <- c(edit_wide, fedit_wide)
+pbs_length <- c(pbs_length, fpbs_length)
+rt_length <- c(rt_length, frt_length)
+pbs_gc <- c(pbs_length, fpbs_length)
+```
+
+A insertions (inside CT)
+
+```{r r-A-ins}
+# the insertion-specific variables
+nt <- 'A' # nucleotide to insert/replace
+type <- 'A_ins' # type of edit
+ori <- 'r' # orientation of target seq in reporter
+ref <- '-' # ref nt: in this case, none
+strand <- 'nonsense' # strand that the edit is introduced on, with respect to the Nluc codon
+
+# make storage vectors for only this edit (to improve speed)
+forientation <- c()
+fedit_strand <- c()
+fedit_type <- c()
+fedit_pos <- c()
+fref_nt <- c()
+fedited_nt <- c()
+fann_rt <- c()
+freverted_rt <- c()
+fnew_rt <- c()
+fgene <- c()
+fguide <- c()
+fpbs <- c()
+fmin_target <- c()
+fwide_target <- c()
+fprotospacer <- c()
+fpct_mlh1 <- c()
+fpct_pemax <- c()
+fpct_diff <- c()
+fpeg_ID <- c()
+fedit_min <- c()
+fedit_wide <- c()
+fpbs_length <- c()
+frt_length <- c()
+fpbs_gc <- c()
+
+# for each gene in the reverse set...
+for (i in 1:nrow(top200_r)) {
+    # parse as numeric vector
+    asvec <- as.numeric(unlist(strsplit(top200_r$A_ins_min[i], ',')))
+    # if first value is not NA,
+    if (is.na(asvec[1]) == FALSE) {
+        # iterate through vector and...
+        for (j in 1:length(asvec)) {
+            # store edit info
+            # gene name
+            gene_name <- top200_f$Gene[i]
+            # orientation
+            forientation <- c(forientation, ori)
+            # edited strand
+            fedit_strand <- c(fedit_strand, strand)
+            # edited NT
+            fedited_nt <- c(fedited_nt, nt)
+            # edit type
+            fedit_type <- c(fedit_type, type)
+            # edit position: number - 17 (number of nt before nick)
+            adj <- asvec[j] - 17
+            fedit_pos <- c(fedit_pos, adj)
+            # reference nt: none
+            fref_nt <- c(fref_nt, ref)
+            
+            # generate character vector from string
+            split <- unlist(strsplit(top200_r$RT_revert[i], ""))
+            
+            # need to insert nt at index of adjusted base
+            split <- append(rev(comp(split)), nt, after = adj-1)
+                
+            # in frame: no need to append after ATG
+            rt_new <- paste0(toupper(rev(comp(split))), collapse='')
+            
+            # store the length of the RT and PBS
+            rtlen <- length(split)
+            pbslen <- top200_r$PBS_length[i]
+            
+            # generate character vectors of the target and wide target sites
+            split_mintar <- unlist(strsplit(top200_r$Target[i], ''))
+            split_widetar <- unlist(strsplit(top200_r$Wide_target_sequence[i], ''))
+            
+            # insert nt at unadjusted index
+            split_mintar <- append(split_mintar, nt, after = asvec[j] - 1)
+            split_widetar <- append(split_widetar, nt, after = asvec[j] - 1)
+            
+            # reconcatenate the sequence into a string
+            edited_mintar <- paste0(toupper(split_mintar), collapse='')
+            edited_widetar <- paste0(toupper(split_widetar), collapse='')
+            
+            # generate unique pegRNA edit ID
+            pegID <- paste0(gene_name, '_', strand, '_', adj, ref, 'to', nt, '_', pbslen, '_', rtlen)
+            
+            # add info to storage vectors gene, guide, PBS, Ann's RT, Ann's reverted RT, minimal target, wide target, protospacer, read pcts
+            fann_rt <- c(fann_rt, top200_r$RT_template[i])
+            freverted_rt <- c(freverted_rt, top200_r$RT_revert[i])
+            fnew_rt <- c(fnew_rt, rt_new)
+            fgene <- c(fgene, top200_r$Gene[i])
+            fguide <- c(fguide, top200_r$Guide[i])
+            fpbs <- c(fpbs, top200_r$PBS_revcomp[i])
+            fmin_target <- c(fmin_target, top200_r$Target[i])
+            fwide_target <- c(fwide_target, top200_r$Wide_target_sequence[i])
+            fprotospacer <- c(fprotospacer, top200_r$Protospacer[i])
+            fpct_mlh1 <- c(fpct_mlh1, top200_r$read_pct_d7_MLH1[i])
+            fpct_pemax <- c(fpct_pemax, top200_r$read_pct_d7_PEmax[i])
+            fpct_diff <- c(fpct_diff, top200_r$mean_diff_pct[i])
+            fpeg_ID <- c(fpeg_ID, pegID)
+            fedit_min <- c(fedit_min, edited_mintar)
+            fedit_wide <- c(fedit_wide, edited_widetar)
+            fpbs_length <- c(fpbs_length, pbslen)
+            frt_length <- c(frt_length, rtlen)
+            fpbs_gc <- c(fpbs_length, top200_r$GC_percent_PBS[i])
+        }
+    }
+}
+
+# how to check for in frame?
+# did/should I have revc of protospacer for reverse?
+
+# store in table creation vectors
+orientation <- c(orientation, forientation)
+edit_strand <- c(edit_strand, fedit_strand)
+edit_type <- c(edit_type, fedit_type)
+edit_pos <- c(edit_pos, fedit_pos)
+ref_nt <- c(ref_nt, fref_nt)
+edited_nt <- c(edited_nt, fedited_nt)
+inframe_append_pos <- c(inframe_append_pos, finframe_append_pos)
+inframe_append_nt <- c(inframe_append_nt, finframe_append_nt)
+ann_rt <- c(ann_rt, fann_rt)
+reverted_rt <- c(reverted_rt, freverted_rt)
+new_rt <- c(new_rt, fnew_rt)
+gene <- c(gene, fgene)
+guide <- c(guide, fguide)
+pbs <- c(pbs, fpbs)
+min_target <- c(min_target, fmin_target)
+wide_target <- c(wide_target, fwide_target)
+protospacer <- c(protospacer, fprotospacer)
+pct_mlh1 <- c(pct_mlh1, fpct_mlh1)
+pct_pemax <- c(pct_pemax, fpct_pemax)
+pct_diff <- c(pct_diff, fpct_diff)
+peg_ID <- c(peg_ID, fpeg_ID)
+edit_min <- c(edit_min, fedit_min)
+edit_wide <- c(edit_wide, fedit_wide)
+pbs_length <- c(pbs_length, fpbs_length)
+rt_length <- c(rt_length, frt_length)
+pbs_gc <- c(pbs_length, fpbs_length)
+```
+
+## Substitutions
+
+### Forward
+
+G substitutions (ATN)
+
+```{r f-G-sub}
+# the insertion-specific variables
+nt <- 'G' # nucleotide to insert/replace
+type <- 'G_sub' # type of edit
+ori <- 'f' # orientation of target seq in reporter
+strand <- 'sense' # strand that the edit is introduced on, with respect to the Nluc codon
+
+# make storage vectors for only this edit (to improve speed)
+forientation <- c()
+fedit_strand <- c()
+fedit_type <- c()
+fedit_pos <- c()
+fref_nt <- c()
+fedited_nt <- c()
+fann_rt <- c()
+freverted_rt <- c()
+fnew_rt <- c()
+fgene <- c()
+fguide <- c()
+fpbs <- c()
+fmin_target <- c()
+fwide_target <- c()
+fprotospacer <- c()
+fpct_mlh1 <- c()
+fpct_pemax <- c()
+fpct_diff <- c()
+fpeg_ID <- c()
+fedit_min <- c()
+fedit_wide <- c()
+fpbs_length <- c()
+frt_length <- c()
+fpbs_gc <- c()
+
+# for each gene in the forward set...
+for (i in 1:nrow(top200_f)) {
+    # parse as numeric vector
+    asvec <- as.numeric(unlist(strsplit(top200_f$G_sub_min[i], ',')))
+    # if first value is not NA,
+    if (is.na(asvec[1]) == FALSE) {
+        # iterate through vector and...
+        for (j in 1:length(asvec)) {
+            # store edit info
+            # gene name
+            gene_name <- top200_f$Gene[i]
+            # orientation: forward
+            forientation <- c(forientation, ori)
+            # edited strand
+            fedit_strand <- c(fedit_strand, strand)
+            # edited NT: G
+            fedited_nt <- c(fedited_nt, nt)
+            # edit type: G ins
+            fedit_type <- c(fedit_type, type)
+            # edit position: number - 17 (number of nt before nick)
+            adj <- asvec[j] - 17
+            fedit_pos <- c(fedit_pos, adj)
+            
+            # generate character vector from string
+            split <- unlist(strsplit(top200_f$RT_revert[i], ""))
+            
+            # make reverse complement of RT template
+            split <- rev(comp(split))
+            
+            # parse the nucleotide at the locus before substitution
+            ref <- toupper(split[adj])
+            
+            # reference nt
+            fref_nt <- c(fref_nt, ref)
+            
+            # need to replace nt at index of adjusted base
+            split[adj] <- nt
+                
+            # in frame: no need to append after ATG
+            rt_new <- paste0(toupper(rev(comp(split))), collapse='')
+            
+            # store the length of the RT and PBS
+            rtlen <- length(split)
+            pbslen <- top200_f$PBS_length[i]
+            
+            # generate character vectors of the target and wide target sites
+            split_mintar <- unlist(strsplit(top200_f$Target[i], ''))
+            split_widetar <- unlist(strsplit(top200_f$Wide_target_sequence[i], ''))
+            
+            # replace nt at unadjusted index
+            split_mintar[asvec[j]] <- nt
+            split_widetar[asvec[j]] <- nt
+            
+            # reconcatenate the sequence into a string
+            edited_mintar <- paste0(toupper(split_mintar), collapse='')
+            edited_widetar <- paste0(toupper(split_widetar), collapse='')
+            
+            # generate unique pegRNA edit ID
+            pegID <- paste0(gene_name, '_', strand, '_', adj, ref, 'to', nt, '_', pbslen, '_', rtlen)
+            
+            # add info to storage vectors gene, guide, PBS, Ann's RT, Ann's reverted RT, minimal target, wide target, protospacer, read pcts
+            fann_rt <- c(fann_rt, top200_f$RT_template[i])
+            freverted_rt <- c(freverted_rt, top200_f$RT_revert[i])
+            fnew_rt <- c(fnew_rt, rt_new)
+            fgene <- c(fgene, top200_f$Gene[i])
+            fguide <- c(fguide, top200_f$Guide[i])
+            fpbs <- c(fpbs, top200_f$PBS_revcomp[i])
+            fmin_target <- c(fmin_target, top200_f$Target[i])
+            fwide_target <- c(fwide_target, top200_f$Wide_target_sequence[i])
+            fprotospacer <- c(fprotospacer, top200_f$Protospacer[i])
+            fpct_mlh1 <- c(fpct_mlh1, top200_f$read_pct_d7_MLH1[i])
+            fpct_pemax <- c(fpct_pemax, top200_f$read_pct_d7_PEmax[i])
+            fpct_diff <- c(fpct_diff, top200_f$mean_diff_pct[i])
+            fpeg_ID <- c(fpeg_ID, pegID)
+            fedit_min <- c(fedit_min, edited_mintar)
+            fedit_wide <- c(fedit_wide, edited_widetar)
+            fpbs_length <- c(fpbs_length, pbslen)
+            frt_length <- c(frt_length, rtlen)
+            fpbs_gc <- c(fpbs_length, top200_f$GC_percent_PBS[i])
+        }
+    }
+}
+
+# store in table creation vectors
+orientation <- c(orientation, forientation)
+edit_strand <- c(edit_strand, fedit_strand)
+edit_type <- c(edit_type, fedit_type)
+edit_pos <- c(edit_pos, fedit_pos)
+ref_nt <- c(ref_nt, fref_nt)
+edited_nt <- c(edited_nt, fedited_nt)
+inframe_append_pos <- c(inframe_append_pos, finframe_append_pos)
+inframe_append_nt <- c(inframe_append_nt, finframe_append_nt)
+ann_rt <- c(ann_rt, fann_rt)
+reverted_rt <- c(reverted_rt, freverted_rt)
+new_rt <- c(new_rt, fnew_rt)
+gene <- c(gene, fgene)
+guide <- c(guide, fguide)
+pbs <- c(pbs, fpbs)
+min_target <- c(min_target, fmin_target)
+wide_target <- c(wide_target, fwide_target)
+protospacer <- c(protospacer, fprotospacer)
+pct_mlh1 <- c(pct_mlh1, fpct_mlh1)
+pct_pemax <- c(pct_pemax, fpct_pemax)
+pct_diff <- c(pct_diff, fpct_diff)
+peg_ID <- c(peg_ID, fpeg_ID)
+edit_min <- c(edit_min, fedit_min)
+edit_wide <- c(edit_wide, fedit_wide)
+pbs_length <- c(pbs_length, fpbs_length)
+rt_length <- c(rt_length, frt_length)
+pbs_gc <- c(pbs_length, fpbs_length)
+```
+
+A substitutions (NTG)
+
+```{r f-A-sub}
+# the insertion-specific variables
+nt <- 'A' # nucleotide to insert/replace
+type <- 'A_sub' # type of edit
+ori <- 'f' # orientation of target seq in reporter
+strand <- 'sense' # strand that the edit is introduced on, with respect to the Nluc codon
+
+# make storage vectors for only this edit (to improve speed)
+forientation <- c()
+fedit_strand <- c()
+fedit_type <- c()
+fedit_pos <- c()
+fref_nt <- c()
+fedited_nt <- c()
+fann_rt <- c()
+freverted_rt <- c()
+fnew_rt <- c()
+fgene <- c()
+fguide <- c()
+fpbs <- c()
+fmin_target <- c()
+fwide_target <- c()
+fprotospacer <- c()
+fpct_mlh1 <- c()
+fpct_pemax <- c()
+fpct_diff <- c()
+fpeg_ID <- c()
+fedit_min <- c()
+fedit_wide <- c()
+fpbs_length <- c()
+frt_length <- c()
+fpbs_gc <- c()
+
+# for each gene in the forward set...
+for (i in 1:nrow(top200_f)) {
+    # parse as numeric vector
+    asvec <- as.numeric(unlist(strsplit(top200_f$A_sub_min[i], ',')))
+    # if first value is not NA,
+    if (is.na(asvec[1]) == FALSE) {
+        # iterate through vector and...
+        for (j in 1:length(asvec)) {
+            # store edit info
+            # gene name
+            gene_name <- top200_f$Gene[i]
+            # orientation: forward
+            forientation <- c(forientation, ori)
+            # edited strand
+            fedit_strand <- c(fedit_strand, strand)
+            # edited NT: G
+            fedited_nt <- c(fedited_nt, nt)
+            # edit type: G ins
+            fedit_type <- c(fedit_type, type)
+            # edit position: number - 17 (number of nt before nick)
+            adj <- asvec[j] - 17
+            fedit_pos <- c(fedit_pos, adj)
+            
+            # generate character vector from string
+            split <- unlist(strsplit(top200_f$RT_revert[i], ""))
+            
+            # make reverse complement of RT template
+            split <- rev(comp(split))
+            
+            # parse the nucleotide at the locus before substitution
+            ref <- toupper(split[adj])
+            
+            # reference nt
+            fref_nt <- c(fref_nt, ref)
+            
+            # need to replace nt at index of adjusted base
+            split[adj] <- nt
+                
+            # in frame: no need to append after ATG
+            rt_new <- paste0(toupper(rev(comp(split))), collapse='')
+            
+            # store the length of the RT and PBS
+            rtlen <- length(split)
+            pbslen <- top200_f$PBS_length[i]
+            
+            # generate character vectors of the target and wide target sites
+            split_mintar <- unlist(strsplit(top200_f$Target[i], ''))
+            split_widetar <- unlist(strsplit(top200_f$Wide_target_sequence[i], ''))
+            
+            # replace nt at unadjusted index
+            split_mintar[asvec[j]] <- nt
+            split_widetar[asvec[j]] <- nt
+            
+            # reconcatenate the sequence into a string
+            edited_mintar <- paste0(toupper(split_mintar), collapse='')
+            edited_widetar <- paste0(toupper(split_widetar), collapse='')
+            
+            # generate unique pegRNA edit ID
+            pegID <- paste0(gene_name, '_', strand, '_', adj, ref, 'to', nt, '_', pbslen, '_', rtlen)
+            
+            # add info to storage vectors gene, guide, PBS, Ann's RT, Ann's reverted RT, minimal target, wide target, protospacer, read pcts
+            fann_rt <- c(fann_rt, top200_f$RT_template[i])
+            freverted_rt <- c(freverted_rt, top200_f$RT_revert[i])
+            fnew_rt <- c(fnew_rt, rt_new)
+            fgene <- c(fgene, top200_f$Gene[i])
+            fguide <- c(fguide, top200_f$Guide[i])
+            fpbs <- c(fpbs, top200_f$PBS_revcomp[i])
+            fmin_target <- c(fmin_target, top200_f$Target[i])
+            fwide_target <- c(fwide_target, top200_f$Wide_target_sequence[i])
+            fprotospacer <- c(fprotospacer, top200_f$Protospacer[i])
+            fpct_mlh1 <- c(fpct_mlh1, top200_f$read_pct_d7_MLH1[i])
+            fpct_pemax <- c(fpct_pemax, top200_f$read_pct_d7_PEmax[i])
+            fpct_diff <- c(fpct_diff, top200_f$mean_diff_pct[i])
+            fpeg_ID <- c(fpeg_ID, pegID)
+            fedit_min <- c(fedit_min, edited_mintar)
+            fedit_wide <- c(fedit_wide, edited_widetar)
+            fpbs_length <- c(fpbs_length, pbslen)
+            frt_length <- c(frt_length, rtlen)
+            fpbs_gc <- c(fpbs_length, top200_f$GC_percent_PBS[i])
+        }
+    }
+}
+
+# store in table creation vectors
+orientation <- c(orientation, forientation)
+edit_strand <- c(edit_strand, fedit_strand)
+edit_type <- c(edit_type, fedit_type)
+edit_pos <- c(edit_pos, fedit_pos)
+ref_nt <- c(ref_nt, fref_nt)
+edited_nt <- c(edited_nt, fedited_nt)
+inframe_append_pos <- c(inframe_append_pos, finframe_append_pos)
+inframe_append_nt <- c(inframe_append_nt, finframe_append_nt)
+ann_rt <- c(ann_rt, fann_rt)
+reverted_rt <- c(reverted_rt, freverted_rt)
+new_rt <- c(new_rt, fnew_rt)
+gene <- c(gene, fgene)
+guide <- c(guide, fguide)
+pbs <- c(pbs, fpbs)
+min_target <- c(min_target, fmin_target)
+wide_target <- c(wide_target, fwide_target)
+protospacer <- c(protospacer, fprotospacer)
+pct_mlh1 <- c(pct_mlh1, fpct_mlh1)
+pct_pemax <- c(pct_pemax, fpct_pemax)
+pct_diff <- c(pct_diff, fpct_diff)
+peg_ID <- c(peg_ID, fpeg_ID)
+edit_min <- c(edit_min, fedit_min)
+edit_wide <- c(edit_wide, fedit_wide)
+pbs_length <- c(pbs_length, fpbs_length)
+rt_length <- c(rt_length, frt_length)
+pbs_gc <- c(pbs_length, fpbs_length)
+```
+
+T substitutions (ANG)
+
+```{r f-T-sub}
+# the insertion-specific variables
+nt <- 'T' # nucleotide to insert/replace
+type <- 'T_sub' # type of edit
+ori <- 'f' # orientation of target seq in reporter
+strand <- 'sense' # strand that the edit is introduced on, with respect to the Nluc codon
+
+# make storage vectors for only this edit (to improve speed)
+forientation <- c()
+fedit_strand <- c()
+fedit_type <- c()
+fedit_pos <- c()
+fref_nt <- c()
+fedited_nt <- c()
+fann_rt <- c()
+freverted_rt <- c()
+fnew_rt <- c()
+fgene <- c()
+fguide <- c()
+fpbs <- c()
+fmin_target <- c()
+fwide_target <- c()
+fprotospacer <- c()
+fpct_mlh1 <- c()
+fpct_pemax <- c()
+fpct_diff <- c()
+fpeg_ID <- c()
+fedit_min <- c()
+fedit_wide <- c()
+fpbs_length <- c()
+frt_length <- c()
+fpbs_gc <- c()
+
+# for each gene in the forward set...
+for (i in 1:nrow(top200_f)) {
+    # parse as numeric vector
+    asvec <- as.numeric(unlist(strsplit(top200_f$T_sub_min[i], ',')))
+    # if first value is not NA,
+    if (is.na(asvec[1]) == FALSE) {
+        # iterate through vector and...
+        for (j in 1:length(asvec)) {
+            # store edit info
+            # gene name
+            gene_name <- top200_f$Gene[i]
+            # orientation: forward
+            forientation <- c(forientation, ori)
+            # edited strand
+            fedit_strand <- c(fedit_strand, strand)
+            # edited NT: G
+            fedited_nt <- c(fedited_nt, nt)
+            # edit type: G ins
+            fedit_type <- c(fedit_type, type)
+            # edit position: number - 17 (number of nt before nick)
+            adj <- asvec[j] - 17
+            fedit_pos <- c(fedit_pos, adj)
+            
+            # generate character vector from string
+            split <- unlist(strsplit(top200_f$RT_revert[i], ""))
+            
+            # make reverse complement of RT template
+            split <- rev(comp(split))
+            
+            # parse the nucleotide at the locus before substitution
+            ref <- toupper(split[adj])
+            
+            # reference nt
+            fref_nt <- c(fref_nt, ref)
+            
+            # need to replace nt at index of adjusted base
+            split[adj] <- nt
+                
+            # in frame: no need to append after ATG
+            rt_new <- paste0(toupper(rev(comp(split))), collapse='')
+            
+            # store the length of the RT and PBS
+            rtlen <- length(split)
+            pbslen <- top200_f$PBS_length[i]
+            
+            # generate character vectors of the target and wide target sites
+            split_mintar <- unlist(strsplit(top200_f$Target[i], ''))
+            split_widetar <- unlist(strsplit(top200_f$Wide_target_sequence[i], ''))
+            
+            # replace nt at unadjusted index
+            split_mintar[asvec[j]] <- nt
+            split_widetar[asvec[j]] <- nt
+            
+            # reconcatenate the sequence into a string
+            edited_mintar <- paste0(toupper(split_mintar), collapse='')
+            edited_widetar <- paste0(toupper(split_widetar), collapse='')
+            
+            # generate unique pegRNA edit ID
+            pegID <- paste0(gene_name, '_', strand, '_', adj, ref, 'to', nt, '_', pbslen, '_', rtlen)
+            
+            # add info to storage vectors gene, guide, PBS, Ann's RT, Ann's reverted RT, minimal target, wide target, protospacer, read pcts
+            fann_rt <- c(fann_rt, top200_f$RT_template[i])
+            freverted_rt <- c(freverted_rt, top200_f$RT_revert[i])
+            fnew_rt <- c(fnew_rt, rt_new)
+            fgene <- c(fgene, top200_f$Gene[i])
+            fguide <- c(fguide, top200_f$Guide[i])
+            fpbs <- c(fpbs, top200_f$PBS_revcomp[i])
+            fmin_target <- c(fmin_target, top200_f$Target[i])
+            fwide_target <- c(fwide_target, top200_f$Wide_target_sequence[i])
+            fprotospacer <- c(fprotospacer, top200_f$Protospacer[i])
+            fpct_mlh1 <- c(fpct_mlh1, top200_f$read_pct_d7_MLH1[i])
+            fpct_pemax <- c(fpct_pemax, top200_f$read_pct_d7_PEmax[i])
+            fpct_diff <- c(fpct_diff, top200_f$mean_diff_pct[i])
+            fpeg_ID <- c(fpeg_ID, pegID)
+            fedit_min <- c(fedit_min, edited_mintar)
+            fedit_wide <- c(fedit_wide, edited_widetar)
+            fpbs_length <- c(fpbs_length, pbslen)
+            frt_length <- c(frt_length, rtlen)
+            fpbs_gc <- c(fpbs_length, top200_f$GC_percent_PBS[i])
+        }
+    }
+}
+
+# store in table creation vectors
+orientation <- c(orientation, forientation)
+edit_strand <- c(edit_strand, fedit_strand)
+edit_type <- c(edit_type, fedit_type)
+edit_pos <- c(edit_pos, fedit_pos)
+ref_nt <- c(ref_nt, fref_nt)
+edited_nt <- c(edited_nt, fedited_nt)
+inframe_append_pos <- c(inframe_append_pos, finframe_append_pos)
+inframe_append_nt <- c(inframe_append_nt, finframe_append_nt)
+ann_rt <- c(ann_rt, fann_rt)
+reverted_rt <- c(reverted_rt, freverted_rt)
+new_rt <- c(new_rt, fnew_rt)
+gene <- c(gene, fgene)
+guide <- c(guide, fguide)
+pbs <- c(pbs, fpbs)
+min_target <- c(min_target, fmin_target)
+wide_target <- c(wide_target, fwide_target)
+protospacer <- c(protospacer, fprotospacer)
+pct_mlh1 <- c(pct_mlh1, fpct_mlh1)
+pct_pemax <- c(pct_pemax, fpct_pemax)
+pct_diff <- c(pct_diff, fpct_diff)
+peg_ID <- c(peg_ID, fpeg_ID)
+edit_min <- c(edit_min, fedit_min)
+edit_wide <- c(edit_wide, fedit_wide)
+pbs_length <- c(pbs_length, fpbs_length)
+rt_length <- c(rt_length, frt_length)
+pbs_gc <- c(pbs_length, fpbs_length)
+```
+
+### Reverse
+
+T substitutions (CAN)
+
+```{r r-T-sub}
+# the insertion-specific variables
+nt <- 'T' # nucleotide to insert/replace
+type <- 'T_sub' # type of edit
+ori <- 'r' # orientation of target seq in reporter
+strand <- 'nonsense' # strand that the edit is introduced on, with respect to the Nluc codon
+
+# make storage vectors for only this edit (to improve speed)
+forientation <- c()
+fedit_strand <- c()
+fedit_type <- c()
+fedit_pos <- c()
+fref_nt <- c()
+fedited_nt <- c()
+fann_rt <- c()
+freverted_rt <- c()
+fnew_rt <- c()
+fgene <- c()
+fguide <- c()
+fpbs <- c()
+fmin_target <- c()
+fwide_target <- c()
+fprotospacer <- c()
+fpct_mlh1 <- c()
+fpct_pemax <- c()
+fpct_diff <- c()
+fpeg_ID <- c()
+fedit_min <- c()
+fedit_wide <- c()
+fpbs_length <- c()
+frt_length <- c()
+fpbs_gc <- c()
+
+# for each gene in the forward set...
+for (i in 1:nrow(top200_r)) {
+    # parse as numeric vector
+    asvec <- as.numeric(unlist(strsplit(top200_r$T_sub_min[i], ',')))
+    # if first value is not NA,
+    if (is.na(asvec[1]) == FALSE) {
+        # iterate through vector and...
+        for (j in 1:length(asvec)) {
+            # store edit info
+            # gene name
+            gene_name <- top200_f$Gene[i]
+            # orientation: forward
+            forientation <- c(forientation, ori)
+            # edited strand
+            fedit_strand <- c(fedit_strand, strand)
+            # edited NT: G
+            fedited_nt <- c(fedited_nt, nt)
+            # edit type: G ins
+            fedit_type <- c(fedit_type, type)
+            # edit position: number - 17 (number of nt before nick)
+            adj <- asvec[j] - 17
+            fedit_pos <- c(fedit_pos, adj)
+            
+            # generate character vector from string
+            split <- unlist(strsplit(top200_r$RT_revert[i], ""))
+            
+            # make reverse complement of RT template
+            split <- rev(comp(split))
+            
+            # parse the nucleotide at the locus before substitution
+            ref <- toupper(split[adj])
+            
+            # reference nt
+            fref_nt <- c(fref_nt, ref)
+            
+            # need to replace nt at index of adjusted base
+            split[adj] <- nt
+                
+            # in frame: no need to append after ATG
+            rt_new <- paste0(toupper(rev(comp(split))), collapse='')
+            
+            # store the length of the RT and PBS
+            rtlen <- length(split)
+            pbslen <- top200_r$PBS_length[i]
+            
+            # generate character vectors of the target and wide target sites
+            split_mintar <- unlist(strsplit(top200_r$Target[i], ''))
+            split_widetar <- unlist(strsplit(top200_r$Wide_target_sequence[i], ''))
+            
+            # replace nt at unadjusted index
+            split_mintar[asvec[j]] <- nt
+            split_widetar[asvec[j]] <- nt
+            
+            # reconcatenate the sequence into a string
+            edited_mintar <- paste0(toupper(split_mintar), collapse='')
+            edited_widetar <- paste0(toupper(split_widetar), collapse='')
+            
+            # generate unique pegRNA edit ID
+            pegID <- paste0(gene_name, '_', strand, '_', adj, ref, 'to', nt, '_', pbslen, '_', rtlen)
+            
+            # add info to storage vectors gene, guide, PBS, Ann's RT, Ann's reverted RT, minimal target, wide target, protospacer, read pcts
+            fann_rt <- c(fann_rt, top200_r$RT_template[i])
+            freverted_rt <- c(freverted_rt, top200_r$RT_revert[i])
+            fnew_rt <- c(fnew_rt, rt_new)
+            fgene <- c(fgene, top200_r$Gene[i])
+            fguide <- c(fguide, top200_r$Guide[i])
+            fpbs <- c(fpbs, top200_r$PBS_revcomp[i])
+            fmin_target <- c(fmin_target, top200_r$Target[i])
+            fwide_target <- c(fwide_target, top200_r$Wide_target_sequence[i])
+            fprotospacer <- c(fprotospacer, top200_r$Protospacer[i])
+            fpct_mlh1 <- c(fpct_mlh1, top200_r$read_pct_d7_MLH1[i])
+            fpct_pemax <- c(fpct_pemax, top200_r$read_pct_d7_PEmax[i])
+            fpct_diff <- c(fpct_diff, top200_r$mean_diff_pct[i])
+            fpeg_ID <- c(fpeg_ID, pegID)
+            fedit_min <- c(fedit_min, edited_mintar)
+            fedit_wide <- c(fedit_wide, edited_widetar)
+            fpbs_length <- c(fpbs_length, pbslen)
+            frt_length <- c(frt_length, rtlen)
+            fpbs_gc <- c(fpbs_length, top200_r$GC_percent_PBS[i])
+        }
+    }
+}
+
+# store in table creation vectors
+orientation <- c(orientation, forientation)
+edit_strand <- c(edit_strand, fedit_strand)
+edit_type <- c(edit_type, fedit_type)
+edit_pos <- c(edit_pos, fedit_pos)
+ref_nt <- c(ref_nt, fref_nt)
+edited_nt <- c(edited_nt, fedited_nt)
+inframe_append_pos <- c(inframe_append_pos, finframe_append_pos)
+inframe_append_nt <- c(inframe_append_nt, finframe_append_nt)
+ann_rt <- c(ann_rt, fann_rt)
+reverted_rt <- c(reverted_rt, freverted_rt)
+new_rt <- c(new_rt, fnew_rt)
+gene <- c(gene, fgene)
+guide <- c(guide, fguide)
+pbs <- c(pbs, fpbs)
+min_target <- c(min_target, fmin_target)
+wide_target <- c(wide_target, fwide_target)
+protospacer <- c(protospacer, fprotospacer)
+pct_mlh1 <- c(pct_mlh1, fpct_mlh1)
+pct_pemax <- c(pct_pemax, fpct_pemax)
+pct_diff <- c(pct_diff, fpct_diff)
+peg_ID <- c(peg_ID, fpeg_ID)
+edit_min <- c(edit_min, fedit_min)
+edit_wide <- c(edit_wide, fedit_wide)
+pbs_length <- c(pbs_length, fpbs_length)
+rt_length <- c(rt_length, frt_length)
+pbs_gc <- c(pbs_length, fpbs_length)
+```
+
+C substitutions (NAT)
+
+```{r r-C-sub}
+# the insertion-specific variables
+nt <- 'C' # nucleotide to insert/replace
+type <- 'C_sub' # type of edit
+ori <- 'r' # orientation of target seq in reporter
+strand <- 'nonsense' # strand that the edit is introduced on, with respect to the Nluc codon
+
+# make storage vectors for only this edit (to improve speed)
+forientation <- c()
+fedit_strand <- c()
+fedit_type <- c()
+fedit_pos <- c()
+fref_nt <- c()
+fedited_nt <- c()
+fann_rt <- c()
+freverted_rt <- c()
+fnew_rt <- c()
+fgene <- c()
+fguide <- c()
+fpbs <- c()
+fmin_target <- c()
+fwide_target <- c()
+fprotospacer <- c()
+fpct_mlh1 <- c()
+fpct_pemax <- c()
+fpct_diff <- c()
+fpeg_ID <- c()
+fedit_min <- c()
+fedit_wide <- c()
+fpbs_length <- c()
+frt_length <- c()
+fpbs_gc <- c()
+
+# for each gene in the forward set...
+for (i in 1:nrow(top200_r)) {
+    # parse as numeric vector
+    asvec <- as.numeric(unlist(strsplit(top200_r$C_sub_min[i], ',')))
+    # if first value is not NA,
+    if (is.na(asvec[1]) == FALSE) {
+        # iterate through vector and...
+        for (j in 1:length(asvec)) {
+            # store edit info
+            # gene name
+            gene_name <- top200_f$Gene[i]
+            # orientation: forward
+            forientation <- c(forientation, ori)
+            # edited strand
+            fedit_strand <- c(fedit_strand, strand)
+            # edited NT: G
+            fedited_nt <- c(fedited_nt, nt)
+            # edit type: G ins
+            fedit_type <- c(fedit_type, type)
+            # edit position: number - 17 (number of nt before nick)
+            adj <- asvec[j] - 17
+            fedit_pos <- c(fedit_pos, adj)
+            
+            # generate character vector from string
+            split <- unlist(strsplit(top200_r$RT_revert[i], ""))
+            
+            # make reverse complement of RT template
+            split <- rev(comp(split))
+            
+            # parse the nucleotide at the locus before substitution
+            ref <- toupper(split[adj])
+            
+            # reference nt
+            fref_nt <- c(fref_nt, ref)
+            
+            # need to replace nt at index of adjusted base
+            split[adj] <- nt
+                
+            # in frame: no need to append after ATG
+            rt_new <- paste0(toupper(rev(comp(split))), collapse='')
+            
+            # store the length of the RT and PBS
+            rtlen <- length(split)
+            pbslen <- top200_r$PBS_length[i]
+            
+            # generate character vectors of the target and wide target sites
+            split_mintar <- unlist(strsplit(top200_r$Target[i], ''))
+            split_widetar <- unlist(strsplit(top200_r$Wide_target_sequence[i], ''))
+            
+            # replace nt at unadjusted index
+            split_mintar[asvec[j]] <- nt
+            split_widetar[asvec[j]] <- nt
+            
+            # reconcatenate the sequence into a string
+            edited_mintar <- paste0(toupper(split_mintar), collapse='')
+            edited_widetar <- paste0(toupper(split_widetar), collapse='')
+            
+            # generate unique pegRNA edit ID
+            pegID <- paste0(gene_name, '_', strand, '_', adj, ref, 'to', nt, '_', pbslen, '_', rtlen)
+            
+            # add info to storage vectors gene, guide, PBS, Ann's RT, Ann's reverted RT, minimal target, wide target, protospacer, read pcts
+            fann_rt <- c(fann_rt, top200_r$RT_template[i])
+            freverted_rt <- c(freverted_rt, top200_r$RT_revert[i])
+            fnew_rt <- c(fnew_rt, rt_new)
+            fgene <- c(fgene, top200_r$Gene[i])
+            fguide <- c(fguide, top200_r$Guide[i])
+            fpbs <- c(fpbs, top200_r$PBS_revcomp[i])
+            fmin_target <- c(fmin_target, top200_r$Target[i])
+            fwide_target <- c(fwide_target, top200_r$Wide_target_sequence[i])
+            fprotospacer <- c(fprotospacer, top200_r$Protospacer[i])
+            fpct_mlh1 <- c(fpct_mlh1, top200_r$read_pct_d7_MLH1[i])
+            fpct_pemax <- c(fpct_pemax, top200_r$read_pct_d7_PEmax[i])
+            fpct_diff <- c(fpct_diff, top200_r$mean_diff_pct[i])
+            fpeg_ID <- c(fpeg_ID, pegID)
+            fedit_min <- c(fedit_min, edited_mintar)
+            fedit_wide <- c(fedit_wide, edited_widetar)
+            fpbs_length <- c(fpbs_length, pbslen)
+            frt_length <- c(frt_length, rtlen)
+            fpbs_gc <- c(fpbs_length, top200_r$GC_percent_PBS[i])
+        }
+    }
+}
+
+# store in table creation vectors
+orientation <- c(orientation, forientation)
+edit_strand <- c(edit_strand, fedit_strand)
+edit_type <- c(edit_type, fedit_type)
+edit_pos <- c(edit_pos, fedit_pos)
+ref_nt <- c(ref_nt, fref_nt)
+edited_nt <- c(edited_nt, fedited_nt)
+inframe_append_pos <- c(inframe_append_pos, finframe_append_pos)
+inframe_append_nt <- c(inframe_append_nt, finframe_append_nt)
+ann_rt <- c(ann_rt, fann_rt)
+reverted_rt <- c(reverted_rt, freverted_rt)
+new_rt <- c(new_rt, fnew_rt)
+gene <- c(gene, fgene)
+guide <- c(guide, fguide)
+pbs <- c(pbs, fpbs)
+min_target <- c(min_target, fmin_target)
+wide_target <- c(wide_target, fwide_target)
+protospacer <- c(protospacer, fprotospacer)
+pct_mlh1 <- c(pct_mlh1, fpct_mlh1)
+pct_pemax <- c(pct_pemax, fpct_pemax)
+pct_diff <- c(pct_diff, fpct_diff)
+peg_ID <- c(peg_ID, fpeg_ID)
+edit_min <- c(edit_min, fedit_min)
+edit_wide <- c(edit_wide, fedit_wide)
+pbs_length <- c(pbs_length, fpbs_length)
+rt_length <- c(rt_length, frt_length)
+pbs_gc <- c(pbs_length, fpbs_length)
+```
+
+A substitutions (CNT)
+
+```{r r-A-sub}
+# the insertion-specific variables
+nt <- 'A' # nucleotide to insert/replace
+type <- 'A_sub' # type of edit
+ori <- 'r' # orientation of target seq in reporter
+strand <- 'nonsense' # strand that the edit is introduced on, with respect to the Nluc codon
+
+# make storage vectors for only this edit (to improve speed)
+forientation <- c()
+fedit_strand <- c()
+fedit_type <- c()
+fedit_pos <- c()
+fref_nt <- c()
+fedited_nt <- c()
+fann_rt <- c()
+freverted_rt <- c()
+fnew_rt <- c()
+fgene <- c()
+fguide <- c()
+fpbs <- c()
+fmin_target <- c()
+fwide_target <- c()
+fprotospacer <- c()
+fpct_mlh1 <- c()
+fpct_pemax <- c()
+fpct_diff <- c()
+fpeg_ID <- c()
+fedit_min <- c()
+fedit_wide <- c()
+fpbs_length <- c()
+frt_length <- c()
+fpbs_gc <- c()
+
+# for each gene in the forward set...
+for (i in 1:nrow(top200_r)) {
+    # parse as numeric vector
+    asvec <- as.numeric(unlist(strsplit(top200_r$A_sub_min[i], ',')))
+    # if first value is not NA,
+    if (is.na(asvec[1]) == FALSE) {
+        # iterate through vector and...
+        for (j in 1:length(asvec)) {
+            # store edit info
+            # gene name
+            gene_name <- top200_f$Gene[i]
+            # orientation: forward
+            forientation <- c(forientation, ori)
+            # edited strand
+            fedit_strand <- c(fedit_strand, strand)
+            # edited NT: G
+            fedited_nt <- c(fedited_nt, nt)
+            # edit type: G ins
+            fedit_type <- c(fedit_type, type)
+            # edit position: number - 17 (number of nt before nick)
+            adj <- asvec[j] - 17
+            fedit_pos <- c(fedit_pos, adj)
+            
+            # generate character vector from string
+            split <- unlist(strsplit(top200_r$RT_revert[i], ""))
+            
+            # make reverse complement of RT template
+            split <- rev(comp(split))
+            
+            # parse the nucleotide at the locus before substitution
+            ref <- toupper(split[adj])
+            
+            # reference nt
+            fref_nt <- c(fref_nt, ref)
+            
+            # need to replace nt at index of adjusted base
+            split[adj] <- nt
+                
+            # in frame: no need to append after ATG
+            rt_new <- paste0(toupper(rev(comp(split))), collapse='')
+            
+            # store the length of the RT and PBS
+            rtlen <- length(split)
+            pbslen <- top200_r$PBS_length[i]
+            
+            # generate character vectors of the target and wide target sites
+            split_mintar <- unlist(strsplit(top200_r$Target[i], ''))
+            split_widetar <- unlist(strsplit(top200_r$Wide_target_sequence[i], ''))
+            
+            # replace nt at unadjusted index
+            split_mintar[asvec[j]] <- nt
+            split_widetar[asvec[j]] <- nt
+            
+            # reconcatenate the sequence into a string
+            edited_mintar <- paste0(toupper(split_mintar), collapse='')
+            edited_widetar <- paste0(toupper(split_widetar), collapse='')
+            
+            # generate unique pegRNA edit ID
+            pegID <- paste0(gene_name, '_', strand, '_', adj, ref, 'to', nt, '_', pbslen, '_', rtlen)
+            
+            # add info to storage vectors gene, guide, PBS, Ann's RT, Ann's reverted RT, minimal target, wide target, protospacer, read pcts
+            fann_rt <- c(fann_rt, top200_r$RT_template[i])
+            freverted_rt <- c(freverted_rt, top200_r$RT_revert[i])
+            fnew_rt <- c(fnew_rt, rt_new)
+            fgene <- c(fgene, top200_r$Gene[i])
+            fguide <- c(fguide, top200_r$Guide[i])
+            fpbs <- c(fpbs, top200_r$PBS_revcomp[i])
+            fmin_target <- c(fmin_target, top200_r$Target[i])
+            fwide_target <- c(fwide_target, top200_r$Wide_target_sequence[i])
+            fprotospacer <- c(fprotospacer, top200_r$Protospacer[i])
+            fpct_mlh1 <- c(fpct_mlh1, top200_r$read_pct_d7_MLH1[i])
+            fpct_pemax <- c(fpct_pemax, top200_r$read_pct_d7_PEmax[i])
+            fpct_diff <- c(fpct_diff, top200_r$mean_diff_pct[i])
+            fpeg_ID <- c(fpeg_ID, pegID)
+            fedit_min <- c(fedit_min, edited_mintar)
+            fedit_wide <- c(fedit_wide, edited_widetar)
+            fpbs_length <- c(fpbs_length, pbslen)
+            frt_length <- c(frt_length, rtlen)
+            fpbs_gc <- c(fpbs_length, top200_r$GC_percent_PBS[i])
+        }
+    }
+}
+
+# store in table creation vectors
+orientation <- c(orientation, forientation)
+edit_strand <- c(edit_strand, fedit_strand)
+edit_type <- c(edit_type, fedit_type)
+edit_pos <- c(edit_pos, fedit_pos)
+ref_nt <- c(ref_nt, fref_nt)
+edited_nt <- c(edited_nt, fedited_nt)
+inframe_append_pos <- c(inframe_append_pos, finframe_append_pos)
+inframe_append_nt <- c(inframe_append_nt, finframe_append_nt)
+ann_rt <- c(ann_rt, fann_rt)
+reverted_rt <- c(reverted_rt, freverted_rt)
+new_rt <- c(new_rt, fnew_rt)
+gene <- c(gene, fgene)
+guide <- c(guide, fguide)
+pbs <- c(pbs, fpbs)
+min_target <- c(min_target, fmin_target)
+wide_target <- c(wide_target, fwide_target)
+protospacer <- c(protospacer, fprotospacer)
+pct_mlh1 <- c(pct_mlh1, fpct_mlh1)
+pct_pemax <- c(pct_pemax, fpct_pemax)
+pct_diff <- c(pct_diff, fpct_diff)
+peg_ID <- c(peg_ID, fpeg_ID)
+edit_min <- c(edit_min, fedit_min)
+edit_wide <- c(edit_wide, fedit_wide)
+pbs_length <- c(pbs_length, fpbs_length)
+rt_length <- c(rt_length, frt_length)
+pbs_gc <- c(pbs_length, fpbs_length)
+```
+
+## Deletions
+
+### Forward
+
+ANTG deletions
+
+```{r f-ANTG-del}
+# the insertion-specific variables
+nt <- '-' # nucleotide to insert/replace: in this case, none
+type <- 'ANTG_del' # type of edit
+ori <- 'f' # orientation of target seq in reporter
+strand <- 'sense' # strand that the edit is introduced on, with respect to the Nluc codon
+
+# make storage vectors for only this edit (to improve speed)
+forientation <- c()
+fedit_strand <- c()
+fedit_type <- c()
+fedit_pos <- c()
+fref_nt <- c()
+fedited_nt <- c()
+fann_rt <- c()
+freverted_rt <- c()
+fnew_rt <- c()
+fgene <- c()
+fguide <- c()
+fpbs <- c()
+fmin_target <- c()
+fwide_target <- c()
+fprotospacer <- c()
+fpct_mlh1 <- c()
+fpct_pemax <- c()
+fpct_diff <- c()
+fpeg_ID <- c()
+fedit_min <- c()
+fedit_wide <- c()
+fpbs_length <- c()
+frt_length <- c()
+fpbs_gc <- c()
+
+# for each gene in the forward set...
+for (i in 1:nrow(top200_f)) {
+    # parse as numeric vector
+    asvec <- as.numeric(unlist(strsplit(top200_f$ANTG_del_min[i], ',')))
+    # if first value is not NA,
+    if (is.na(asvec[1]) == FALSE) {
+        # iterate through vector and...
+        for (j in 1:length(asvec)) {
+            # store edit info
+            # gene name
+            gene_name <- top200_f$Gene[i]
+            # orientation: forward
+            forientation <- c(forientation, ori)
+            # edited strand
+            fedit_strand <- c(fedit_strand, strand)
+            # edited NT: G
+            fedited_nt <- c(fedited_nt, nt)
+            # edit type: G ins
+            fedit_type <- c(fedit_type, type)
+            # edit position: number - 17 (number of nt before nick)
+            adj <- asvec[j] - 17
+            fedit_pos <- c(fedit_pos, adj)
+            
+            # generate character vector from string
+            split <- unlist(strsplit(top200_f$RT_revert[i], ""))
+            
+            # make reverse complement of RT template
+            split <- rev(comp(split))
+            
+            # parse the nucleotide at the locus before deletion
+            ref <- toupper(split[adj])
+            
+            # reference nt
+            fref_nt <- c(fref_nt, ref)
+            
+            # need to replace nt at index of adjusted base with nothing
+            split <- split[-adj]
+                
+            # in frame: no need to append after ATG
+            rt_new <- paste0(toupper(rev(comp(split))), collapse='')
+            
+            # store the length of the RT and PBS
+            rtlen <- length(split)
+            pbslen <- top200_f$PBS_length[i]
+            
+            # generate character vectors of the target and wide target sites
+            split_mintar <- unlist(strsplit(top200_f$Target[i], ''))
+            split_widetar <- unlist(strsplit(top200_f$Wide_target_sequence[i], ''))
+            
+            # replace nt at unadjusted index
+            split_mintar <- split_mintar[-asvec[j]]
+            split_widetar <- split_widetar[-asvec[j]]
+            
+            # reconcatenate the sequence into a string
+            edited_mintar <- paste0(toupper(split_mintar), collapse='')
+            edited_widetar <- paste0(toupper(split_widetar), collapse='')
+            
+            # generate unique pegRNA edit ID
+            pegID <- paste0(gene_name, '_', strand, '_', adj, ref, 'to', nt, '_', pbslen, '_', rtlen)
+            
+            # add info to storage vectors gene, guide, PBS, Ann's RT, Ann's reverted RT, minimal target, wide target, protospacer, read pcts
+            fann_rt <- c(fann_rt, top200_f$RT_template[i])
+            freverted_rt <- c(freverted_rt, top200_f$RT_revert[i])
+            fnew_rt <- c(fnew_rt, rt_new)
+            fgene <- c(fgene, top200_f$Gene[i])
+            fguide <- c(fguide, top200_f$Guide[i])
+            fpbs <- c(fpbs, top200_f$PBS_revcomp[i])
+            fmin_target <- c(fmin_target, top200_f$Target[i])
+            fwide_target <- c(fwide_target, top200_f$Wide_target_sequence[i])
+            fprotospacer <- c(fprotospacer, top200_f$Protospacer[i])
+            fpct_mlh1 <- c(fpct_mlh1, top200_f$read_pct_d7_MLH1[i])
+            fpct_pemax <- c(fpct_pemax, top200_f$read_pct_d7_PEmax[i])
+            fpct_diff <- c(fpct_diff, top200_f$mean_diff_pct[i])
+            fpeg_ID <- c(fpeg_ID, pegID)
+            fedit_min <- c(fedit_min, edited_mintar)
+            fedit_wide <- c(fedit_wide, edited_widetar)
+            fpbs_length <- c(fpbs_length, pbslen)
+            frt_length <- c(frt_length, rtlen)
+            fpbs_gc <- c(fpbs_length, top200_f$GC_percent_PBS[i])
+        }
+    }
+}
+
+# store in table creation vectors
+orientation <- c(orientation, forientation)
+edit_strand <- c(edit_strand, fedit_strand)
+edit_type <- c(edit_type, fedit_type)
+edit_pos <- c(edit_pos, fedit_pos)
+ref_nt <- c(ref_nt, fref_nt)
+edited_nt <- c(edited_nt, fedited_nt)
+inframe_append_pos <- c(inframe_append_pos, finframe_append_pos)
+inframe_append_nt <- c(inframe_append_nt, finframe_append_nt)
+ann_rt <- c(ann_rt, fann_rt)
+reverted_rt <- c(reverted_rt, freverted_rt)
+new_rt <- c(new_rt, fnew_rt)
+gene <- c(gene, fgene)
+guide <- c(guide, fguide)
+pbs <- c(pbs, fpbs)
+min_target <- c(min_target, fmin_target)
+wide_target <- c(wide_target, fwide_target)
+protospacer <- c(protospacer, fprotospacer)
+pct_mlh1 <- c(pct_mlh1, fpct_mlh1)
+pct_pemax <- c(pct_pemax, fpct_pemax)
+pct_diff <- c(pct_diff, fpct_diff)
+peg_ID <- c(peg_ID, fpeg_ID)
+edit_min <- c(edit_min, fedit_min)
+edit_wide <- c(edit_wide, fedit_wide)
+pbs_length <- c(pbs_length, fpbs_length)
+rt_length <- c(rt_length, frt_length)
+pbs_gc <- c(pbs_length, fpbs_length)
+```
+
+ATNG deletions
+
+```{r f-ATNG-del}
+# the insertion-specific variables
+nt <- '-' # nucleotide to insert/replace: in this case, none
+type <- 'ATNG_del' # type of edit
+ori <- 'f' # orientation of target seq in reporter
+strand <- 'sense' # strand that the edit is introduced on, with respect to the Nluc codon
+
+# make storage vectors for only this edit (to improve speed)
+forientation <- c()
+fedit_strand <- c()
+fedit_type <- c()
+fedit_pos <- c()
+fref_nt <- c()
+fedited_nt <- c()
+fann_rt <- c()
+freverted_rt <- c()
+fnew_rt <- c()
+fgene <- c()
+fguide <- c()
+fpbs <- c()
+fmin_target <- c()
+fwide_target <- c()
+fprotospacer <- c()
+fpct_mlh1 <- c()
+fpct_pemax <- c()
+fpct_diff <- c()
+fpeg_ID <- c()
+fedit_min <- c()
+fedit_wide <- c()
+fpbs_length <- c()
+frt_length <- c()
+fpbs_gc <- c()
+
+# for each gene in the forward set...
+for (i in 1:nrow(top200_f)) {
+    # parse as numeric vector
+    asvec <- as.numeric(unlist(strsplit(top200_f$ATNG_del_min[i], ',')))
+    # if first value is not NA,
+    if (is.na(asvec[1]) == FALSE) {
+        # iterate through vector and...
+        for (j in 1:length(asvec)) {
+            # store edit info
+            # gene name
+            gene_name <- top200_f$Gene[i]
+            # orientation: forward
+            forientation <- c(forientation, ori)
+            # edited strand
+            fedit_strand <- c(fedit_strand, strand)
+            # edited NT: G
+            fedited_nt <- c(fedited_nt, nt)
+            # edit type: G ins
+            fedit_type <- c(fedit_type, type)
+            # edit position: number - 17 (number of nt before nick)
+            adj <- asvec[j] - 17
+            fedit_pos <- c(fedit_pos, adj)
+            
+            # generate character vector from string
+            split <- unlist(strsplit(top200_f$RT_revert[i], ""))
+            
+            # make reverse complement of RT template
+            split <- rev(comp(split))
+            
+            # parse the nucleotide at the locus before deletion
+            ref <- toupper(split[adj])
+            
+            # reference nt
+            fref_nt <- c(fref_nt, ref)
+            
+            # need to replace nt at index of adjusted base with nothing
+            split <- split[-adj]
+                
+            # in frame: no need to append after ATG
+            rt_new <- paste0(toupper(rev(comp(split))), collapse='')
+            
+            # store the length of the RT and PBS
+            rtlen <- length(split)
+            pbslen <- top200_f$PBS_length[i]
+            
+            # generate character vectors of the target and wide target sites
+            split_mintar <- unlist(strsplit(top200_f$Target[i], ''))
+            split_widetar <- unlist(strsplit(top200_f$Wide_target_sequence[i], ''))
+            
+            # replace nt at unadjusted index
+            split_mintar <- split_mintar[-asvec[j]]
+            split_widetar <- split_widetar[-asvec[j]]
+            
+            # reconcatenate the sequence into a string
+            edited_mintar <- paste0(toupper(split_mintar), collapse='')
+            edited_widetar <- paste0(toupper(split_widetar), collapse='')
+            
+            # generate unique pegRNA edit ID
+            pegID <- paste0(gene_name, '_', strand, '_', adj, ref, 'to', nt, '_', pbslen, '_', rtlen)
+            
+            # add info to storage vectors gene, guide, PBS, Ann's RT, Ann's reverted RT, minimal target, wide target, protospacer, read pcts
+            fann_rt <- c(fann_rt, top200_f$RT_template[i])
+            freverted_rt <- c(freverted_rt, top200_f$RT_revert[i])
+            fnew_rt <- c(fnew_rt, rt_new)
+            fgene <- c(fgene, top200_f$Gene[i])
+            fguide <- c(fguide, top200_f$Guide[i])
+            fpbs <- c(fpbs, top200_f$PBS_revcomp[i])
+            fmin_target <- c(fmin_target, top200_f$Target[i])
+            fwide_target <- c(fwide_target, top200_f$Wide_target_sequence[i])
+            fprotospacer <- c(fprotospacer, top200_f$Protospacer[i])
+            fpct_mlh1 <- c(fpct_mlh1, top200_f$read_pct_d7_MLH1[i])
+            fpct_pemax <- c(fpct_pemax, top200_f$read_pct_d7_PEmax[i])
+            fpct_diff <- c(fpct_diff, top200_f$mean_diff_pct[i])
+            fpeg_ID <- c(fpeg_ID, pegID)
+            fedit_min <- c(fedit_min, edited_mintar)
+            fedit_wide <- c(fedit_wide, edited_widetar)
+            fpbs_length <- c(fpbs_length, pbslen)
+            frt_length <- c(frt_length, rtlen)
+            fpbs_gc <- c(fpbs_length, top200_f$GC_percent_PBS[i])
+        }
+    }
+}
+
+# store in table creation vectors
+orientation <- c(orientation, forientation)
+edit_strand <- c(edit_strand, fedit_strand)
+edit_type <- c(edit_type, fedit_type)
+edit_pos <- c(edit_pos, fedit_pos)
+ref_nt <- c(ref_nt, fref_nt)
+edited_nt <- c(edited_nt, fedited_nt)
+inframe_append_pos <- c(inframe_append_pos, finframe_append_pos)
+inframe_append_nt <- c(inframe_append_nt, finframe_append_nt)
+ann_rt <- c(ann_rt, fann_rt)
+reverted_rt <- c(reverted_rt, freverted_rt)
+new_rt <- c(new_rt, fnew_rt)
+gene <- c(gene, fgene)
+guide <- c(guide, fguide)
+pbs <- c(pbs, fpbs)
+min_target <- c(min_target, fmin_target)
+wide_target <- c(wide_target, fwide_target)
+protospacer <- c(protospacer, fprotospacer)
+pct_mlh1 <- c(pct_mlh1, fpct_mlh1)
+pct_pemax <- c(pct_pemax, fpct_pemax)
+pct_diff <- c(pct_diff, fpct_diff)
+peg_ID <- c(peg_ID, fpeg_ID)
+edit_min <- c(edit_min, fedit_min)
+edit_wide <- c(edit_wide, fedit_wide)
+pbs_length <- c(pbs_length, fpbs_length)
+rt_length <- c(rt_length, frt_length)
+pbs_gc <- c(pbs_length, fpbs_length)
+```
+
+### Reverse
+
+CANT deletions
+
+```{r r-CANT-del}
+# the insertion-specific variables
+nt <- '-' # nucleotide to insert/replace: in this case, none
+type <- 'CANT_del' # type of edit
+ori <- 'r' # orientation of target seq in reporter
+strand <- 'nonsense' # strand that the edit is introduced on, with respect to the Nluc codon
+
+# make storage vectors for only this edit (to improve speed)
+forientation <- c()
+fedit_strand <- c()
+fedit_type <- c()
+fedit_pos <- c()
+fref_nt <- c()
+fedited_nt <- c()
+fann_rt <- c()
+freverted_rt <- c()
+fnew_rt <- c()
+fgene <- c()
+fguide <- c()
+fpbs <- c()
+fmin_target <- c()
+fwide_target <- c()
+fprotospacer <- c()
+fpct_mlh1 <- c()
+fpct_pemax <- c()
+fpct_diff <- c()
+fpeg_ID <- c()
+fedit_min <- c()
+fedit_wide <- c()
+fpbs_length <- c()
+frt_length <- c()
+fpbs_gc <- c()
+
+# for each gene in the forward set...
+for (i in 1:nrow(top200_r)) {
+    # parse as numeric vector
+    asvec <- as.numeric(unlist(strsplit(top200_r$CANT_del_min[i], ',')))
+    # if first value is not NA,
+    if (is.na(asvec[1]) == FALSE) {
+        # iterate through vector and...
+        for (j in 1:length(asvec)) {
+            # store edit info
+            # gene name
+            gene_name <- top200_f$Gene[i]
+            # orientation: forward
+            forientation <- c(forientation, ori)
+            # edited strand
+            fedit_strand <- c(fedit_strand, strand)
+            # edited NT: G
+            fedited_nt <- c(fedited_nt, nt)
+            # edit type: G ins
+            fedit_type <- c(fedit_type, type)
+            # edit position: number - 17 (number of nt before nick)
+            adj <- asvec[j] - 17
+            fedit_pos <- c(fedit_pos, adj)
+            
+            # generate character vector from string
+            split <- unlist(strsplit(top200_r$RT_revert[i], ""))
+            
+            # make reverse complement of RT template
+            split <- rev(comp(split))
+            
+            # parse the nucleotide at the locus before deletion
+            ref <- toupper(split[adj])
+            
+            # reference nt
+            fref_nt <- c(fref_nt, ref)
+            
+            # need to replace nt at index of adjusted base with nothing
+            split <- split[-adj]
+                
+            # in frame: no need to append after ATG
+            rt_new <- paste0(toupper(rev(comp(split))), collapse='')
+            
+            # store the length of the RT and PBS
+            rtlen <- length(split)
+            pbslen <- top200_r$PBS_length[i]
+            
+            # generate character vectors of the target and wide target sites
+            split_mintar <- unlist(strsplit(top200_r$Target[i], ''))
+            split_widetar <- unlist(strsplit(top200_r$Wide_target_sequence[i], ''))
+            
+            # replace nt at unadjusted index
+            split_mintar <- split_mintar[-asvec[j]]
+            split_widetar <- split_widetar[-asvec[j]]
+            
+            # reconcatenate the sequence into a string
+            edited_mintar <- paste0(toupper(split_mintar), collapse='')
+            edited_widetar <- paste0(toupper(split_widetar), collapse='')
+            
+            # generate unique pegRNA edit ID
+            pegID <- paste0(gene_name, '_', strand, '_', adj, ref, 'to', nt, '_', pbslen, '_', rtlen)
+            
+            # add info to storage vectors gene, guide, PBS, Ann's RT, Ann's reverted RT, minimal target, wide target, protospacer, read pcts
+            fann_rt <- c(fann_rt, top200_r$RT_template[i])
+            freverted_rt <- c(freverted_rt, top200_r$RT_revert[i])
+            fnew_rt <- c(fnew_rt, rt_new)
+            fgene <- c(fgene, top200_r$Gene[i])
+            fguide <- c(fguide, top200_r$Guide[i])
+            fpbs <- c(fpbs, top200_r$PBS_revcomp[i])
+            fmin_target <- c(fmin_target, top200_r$Target[i])
+            fwide_target <- c(fwide_target, top200_r$Wide_target_sequence[i])
+            fprotospacer <- c(fprotospacer, top200_r$Protospacer[i])
+            fpct_mlh1 <- c(fpct_mlh1, top200_r$read_pct_d7_MLH1[i])
+            fpct_pemax <- c(fpct_pemax, top200_r$read_pct_d7_PEmax[i])
+            fpct_diff <- c(fpct_diff, top200_r$mean_diff_pct[i])
+            fpeg_ID <- c(fpeg_ID, pegID)
+            fedit_min <- c(fedit_min, edited_mintar)
+            fedit_wide <- c(fedit_wide, edited_widetar)
+            fpbs_length <- c(fpbs_length, pbslen)
+            frt_length <- c(frt_length, rtlen)
+            fpbs_gc <- c(fpbs_length, top200_r$GC_percent_PBS[i])
+        }
+    }
+}
+
+# store in table creation vectors
+orientation <- c(orientation, forientation)
+edit_strand <- c(edit_strand, fedit_strand)
+edit_type <- c(edit_type, fedit_type)
+edit_pos <- c(edit_pos, fedit_pos)
+ref_nt <- c(ref_nt, fref_nt)
+edited_nt <- c(edited_nt, fedited_nt)
+inframe_append_pos <- c(inframe_append_pos, finframe_append_pos)
+inframe_append_nt <- c(inframe_append_nt, finframe_append_nt)
+ann_rt <- c(ann_rt, fann_rt)
+reverted_rt <- c(reverted_rt, freverted_rt)
+new_rt <- c(new_rt, fnew_rt)
+gene <- c(gene, fgene)
+guide <- c(guide, fguide)
+pbs <- c(pbs, fpbs)
+min_target <- c(min_target, fmin_target)
+wide_target <- c(wide_target, fwide_target)
+protospacer <- c(protospacer, fprotospacer)
+pct_mlh1 <- c(pct_mlh1, fpct_mlh1)
+pct_pemax <- c(pct_pemax, fpct_pemax)
+pct_diff <- c(pct_diff, fpct_diff)
+peg_ID <- c(peg_ID, fpeg_ID)
+edit_min <- c(edit_min, fedit_min)
+edit_wide <- c(edit_wide, fedit_wide)
+pbs_length <- c(pbs_length, fpbs_length)
+rt_length <- c(rt_length, frt_length)
+pbs_gc <- c(pbs_length, fpbs_length)
+```
+
+CNAT deletions
+
+```{r r-CNAT-del}
+# the insertion-specific variables
+nt <- '-' # nucleotide to insert/replace: in this case, none
+type <- 'CNAT_del' # type of edit
+ori <- 'r' # orientation of target seq in reporter
+strand <- 'nonsense' # strand that the edit is introduced on, with respect to the Nluc codon
+
+# make storage vectors for only this edit (to improve speed)
+forientation <- c()
+fedit_strand <- c()
+fedit_type <- c()
+fedit_pos <- c()
+fref_nt <- c()
+fedited_nt <- c()
+fann_rt <- c()
+freverted_rt <- c()
+fnew_rt <- c()
+fgene <- c()
+fguide <- c()
+fpbs <- c()
+fmin_target <- c()
+fwide_target <- c()
+fprotospacer <- c()
+fpct_mlh1 <- c()
+fpct_pemax <- c()
+fpct_diff <- c()
+fpeg_ID <- c()
+fedit_min <- c()
+fedit_wide <- c()
+fpbs_length <- c()
+frt_length <- c()
+fpbs_gc <- c()
+
+# for each gene in the forward set...
+for (i in 1:nrow(top200_r)) {
+    # parse as numeric vector
+    asvec <- as.numeric(unlist(strsplit(top200_r$CNAT_del_min[i], ',')))
+    # if first value is not NA,
+    if (is.na(asvec[1]) == FALSE) {
+        # iterate through vector and...
+        for (j in 1:length(asvec)) {
+            # store edit info
+            # gene name
+            gene_name <- top200_f$Gene[i]
+            # orientation: forward
+            forientation <- c(forientation, ori)
+            # edited strand
+            fedit_strand <- c(fedit_strand, strand)
+            # edited NT: G
+            fedited_nt <- c(fedited_nt, nt)
+            # edit type: G ins
+            fedit_type <- c(fedit_type, type)
+            # edit position: number - 17 (number of nt before nick)
+            adj <- asvec[j] - 17
+            fedit_pos <- c(fedit_pos, adj)
+            
+            # generate character vector from string
+            split <- unlist(strsplit(top200_r$RT_revert[i], ""))
+            
+            # make reverse complement of RT template
+            split <- rev(comp(split))
+            
+            # parse the nucleotide at the locus before deletion
+            ref <- toupper(split[adj])
+            
+            # reference nt
+            fref_nt <- c(fref_nt, ref)
+            
+            # need to replace nt at index of adjusted base with nothing
+            split <- split[-adj]
+                
+            # in frame: no need to append after ATG
+            rt_new <- paste0(toupper(rev(comp(split))), collapse='')
+            
+            # store the length of the RT and PBS
+            rtlen <- length(split)
+            pbslen <- top200_r$PBS_length[i]
+            
+            # generate character vectors of the target and wide target sites
+            split_mintar <- unlist(strsplit(top200_r$Target[i], ''))
+            split_widetar <- unlist(strsplit(top200_r$Wide_target_sequence[i], ''))
+            
+            # replace nt at unadjusted index
+            split_mintar <- split_mintar[-asvec[j]]
+            split_widetar <- split_widetar[-asvec[j]]
+            
+            # reconcatenate the sequence into a string
+            edited_mintar <- paste0(toupper(split_mintar), collapse='')
+            edited_widetar <- paste0(toupper(split_widetar), collapse='')
+            
+            # generate unique pegRNA edit ID
+            pegID <- paste0(gene_name, '_', strand, '_', adj, ref, 'to', nt, '_', pbslen, '_', rtlen)
+            
+            # add info to storage vectors gene, guide, PBS, Ann's RT, Ann's reverted RT, minimal target, wide target, protospacer, read pcts
+            fann_rt <- c(fann_rt, top200_r$RT_template[i])
+            freverted_rt <- c(freverted_rt, top200_r$RT_revert[i])
+            fnew_rt <- c(fnew_rt, rt_new)
+            fgene <- c(fgene, top200_r$Gene[i])
+            fguide <- c(fguide, top200_r$Guide[i])
+            fpbs <- c(fpbs, top200_r$PBS_revcomp[i])
+            fmin_target <- c(fmin_target, top200_r$Target[i])
+            fwide_target <- c(fwide_target, top200_r$Wide_target_sequence[i])
+            fprotospacer <- c(fprotospacer, top200_r$Protospacer[i])
+            fpct_mlh1 <- c(fpct_mlh1, top200_r$read_pct_d7_MLH1[i])
+            fpct_pemax <- c(fpct_pemax, top200_r$read_pct_d7_PEmax[i])
+            fpct_diff <- c(fpct_diff, top200_r$mean_diff_pct[i])
+            fpeg_ID <- c(fpeg_ID, pegID)
+            fedit_min <- c(fedit_min, edited_mintar)
+            fedit_wide <- c(fedit_wide, edited_widetar)
+            fpbs_length <- c(fpbs_length, pbslen)
+            frt_length <- c(frt_length, rtlen)
+            fpbs_gc <- c(fpbs_length, top200_r$GC_percent_PBS[i])
+        }
+    }
+}
+
+# store in table creation vectors
+orientation <- c(orientation, forientation)
+edit_strand <- c(edit_strand, fedit_strand)
+edit_type <- c(edit_type, fedit_type)
+edit_pos <- c(edit_pos, fedit_pos)
+ref_nt <- c(ref_nt, fref_nt)
+edited_nt <- c(edited_nt, fedited_nt)
+inframe_append_pos <- c(inframe_append_pos, finframe_append_pos)
+inframe_append_nt <- c(inframe_append_nt, finframe_append_nt)
+ann_rt <- c(ann_rt, fann_rt)
+reverted_rt <- c(reverted_rt, freverted_rt)
+new_rt <- c(new_rt, fnew_rt)
+gene <- c(gene, fgene)
+guide <- c(guide, fguide)
+pbs <- c(pbs, fpbs)
+min_target <- c(min_target, fmin_target)
+wide_target <- c(wide_target, fwide_target)
+protospacer <- c(protospacer, fprotospacer)
+pct_mlh1 <- c(pct_mlh1, fpct_mlh1)
+pct_pemax <- c(pct_pemax, fpct_pemax)
+pct_diff <- c(pct_diff, fpct_diff)
+peg_ID <- c(peg_ID, fpeg_ID)
+edit_min <- c(edit_min, fedit_min)
+edit_wide <- c(edit_wide, fedit_wide)
+pbs_length <- c(pbs_length, fpbs_length)
+rt_length <- c(rt_length, frt_length)
+pbs_gc <- c(pbs_length, fpbs_length)
+```
+
+```{r make-table-old}
+# generate a table from the storage vectors
+peg_library <- tibble(pegRNA_ID = peg_ID, Gene = gene, Guide = guide, PBS = pbs, 
+                      Anns_RT = ann_rt, 
+                      Reverted_RT = reverted_rt, RT_template = new_rt, 
+                      Minimal_target_sequence = min_target, 
+                      Wide_target_sequence = wide_target, 
+                      Target_orientation = orientation, 
+                      Edited_strand = edit_strand, Edit_type = edit_type, 
+                      Edit_position = edit_pos, Reference_nt = ref_nt, 
+                      Edited_nt = edited_nt, PBS_length = pbs_length,
+                      RT_length = rt_length, GC_percent_PBS = pbs_gc,
+                      Edited_minimal_target = edit_min, 
+                      Edited_wide_target = edit_wide, Protospacer = protospacer, 
+                      Edit_pct_MLH1 = pct_mlh1, Edit_pct_PEmax = pct_pemax, 
+                      Edit_pct_difference = pct_diff)
+```
+
+Check to make sure the edit is in-frame: if not, find the number of nucleotides to append
+
+Select the nt between the start codon and Nluc 
+
+```{r inframe}
+# create storage vectors
+n_toappend <- c() # the number of nt to append to make the ATG in-frame
+coding_seq <- c() # the nt between the start codon and the beginning of Nluc
+
+
+# for each edited minimal target sequence...
+for (i in 1:nrow(peg_library)) {
+    # if the edit is on the sense strand...
+    if (peg_library$Edited_strand[i] == 'sense') {
+        # split the target into a vector of individual characters
+        split_mintar <- unlist(strsplit(peg_library$Edited_minimal_target[i], ''))
+        
+        # find length of target
+        min_len <- length(split_mintar)
+        
+        # find start of ATG
+        ATG_start <- unlist(gregexpr('ATG', peg_library$Edited_minimal_target[i], fixed=TRUE))
+        
+        # substring the nt starting with ATG -- this is the coding sequence
+        after_ATG <- substr(peg_library$Edited_minimal_target[i], ATG_start, 24)
+    }
+    
+    # if the edit is on the nonsense strand...
+    if (peg_library$Edited_strand[i] == 'nonsense') {
+        # split the target into a vector of individual characters
+        split_mintar <- unlist(strsplit(peg_library$Edited_minimal_target[i], ''))
+        
+        # get the reverse complement of the target site (need sense strand)
+        split_mintar_rc <- rev(comp(split_mintar))
+        
+        # concatenate vector to string
+        mintar_rc <- paste0(toupper(split_mintar_rc), collapse='')
+        
+        # find length of target
+        min_len <- length(split_mintar)
+        
+        # find start of ATG
+        ATG_start <- unlist(gregexpr('ATG', mintar_rc, fixed=TRUE))
+        
+        # substring the nt starting with ATG -- this is the coding sequence
+        after_ATG <- substr(mintar_rc, ATG_start, 24)
+    }
+    # subtract end of ATG index from the target length
+    dist_nluc <- min_len - (ATG_start + 2)
+        
+    # find dist_nluc modulo 3 to determine if CAT is in-frame
+    leftover <- dist_nluc %% 3
+    
+    # subtract the leftover from 3 to get the number of nt to append
+    toappend <- 3 - leftover
+    
+    # if toappend is 3, change its value to 0: the edit is in frame
+    if (toappend == 3) toappend <- 0
+        
+    # add to the storage vectors
+    n_toappend <- c(n_toappend, toappend)
+    coding_seq <- c(coding_seq, after_ATG)
+}
+```
+
+```{r add-totable}
+# add the storage vectors to the library data
+peg_library <- peg_library %>% mutate(Number_to_Append = n_toappend,
+                                      Start_of_Coding_Seq = coding_seq)
+```
+
+Remove any edits where the protospacer coding sequence contains a stop codon from the data
+
+```{r remove-stop}
+codon_list <- vector(length=nrow(peg_library))
+
+# split sequence into codons
+for (i in 1:nrow(peg_library)) {
+    # split the seq into a vector of individual characters
+    seq <- unlist(strsplit(peg_library$Start_of_Coding_Seq[i], ''))
+    codons <- splitseq(seq, frame=0, word=3)
+    codon_list[i] <- toString(codons)
+}
+
+peg_library <- peg_library %>% mutate(Starting_Codons = codon_list)
+
+# search for stop codons in Start_of_Coding_Seq
+peg_library_stops <- peg_library %>% mutate(Coding_hasUAA = grepl('TAA', peg_library$Starting_Codons, fixed = TRUE),
+                                      Coding_hasUAG = grepl('TAG', peg_library$Starting_Codons, fixed = TRUE),
+                                      Coding_hasUGA = grepl('TGA', peg_library$Starting_Codons, fixed = TRUE))
+
+# storage vector for for loop
+anystops <- c()
+
+# for each row...
+for (i in 1:nrow(peg_library_stops)) {
+    # are any of the stop codons present?
+    stops <- any(c(peg_library_stops$Coding_hasUAA[i] == TRUE, 
+                   peg_library_stops$Coding_hasUAG[i] == TRUE,
+                   peg_library_stops$Coding_hasUGA[i] == TRUE))
+    anystops <- c(anystops, stops)
+}
+
+peg_library_stops <- peg_library_stops %>% mutate(Coding_hasStop = anystops)
+
+# remove any data where Coding_hasStop == TRUE
+peg_library_stops <- peg_library_stops %>% filter(Coding_hasStop == FALSE)
+```
+
+make a list of codons in preferred order
+
+Ranking hierarchy:
+1) nonpolar over polar uncharged over aromatic over polar charged sidechain
+2) small sidechain over large sidechain
+3) codon likelihood
+
+```{r make-codon-table}
+codon_rank <- c('GGC', 'GGA', 'GGG', 'GGT', 'GCC', 'GCT', 'GCA', 'GCG', 'GTG', 'GTC', 'GTT', 'GTA', 'CTG', 'CTC', 'CTT', 'TTG', 'TTA', 'CTA', 'ATC', 'ATT', 'ATA', 'AGC', 'TCC', 'TCT', 'AGT', 'TCA', 'TCG', 'ACC', 'ACA', 'ACT', 'ACG', 'TGC', 'TGT', 'AAC', 'AAT', 'CAG', 'CAA', 'CCC', 'CCT', 'CCA', 'CCG', 'TTC', 'TTT', 'TAC', 'TAT', 'TGG', 'GAC', 'GAT', 'GAG', 'GAA', 'AAG', 'AAA', 'AGA', 'AGG', 'CGG', 'CGC', 'CGA', 'CGT', 'CAC', 'CAT')
+amino_rank <- c('Gly', 'Gly', 'Gly', 'Gly', 'Ala', 'Ala', 'Ala', 'Ala', 'Val', 'Val', 'Val', 'Val', 'Leu', 'Leu', 'Leu', 'Leu', 'Leu', 'Leu', 'Ile', 'Ile', 'Ile', 'Ser', 'Ser', 'Ser', 'Ser', 'Ser', 'Ser', 'Thr', 'Thr', 'Thr', 'Thr', 'Cys', 'Cys', 'Asn', 'Asn', 'Gln', 'Gln', 'Pro', 'Pro', 'Pro', 'Pro', 'Phe', 'Phe', 'Tyr', 'Tyr', 'Trp', 'Asp', 'Asp', 'Glu', 'Glu', 'Lys', 'Lys', 'Arg', 'Arg', 'Arg', 'Arg', 'Arg', 'Arg', 'His', 'His')
+
+codon_ranking <- tibble(Codon = codon_rank, Amino_Acid = amino_rank)
+write.csv(codon_ranking, 'Ranked_Codon_List.csv', row.names = TRUE)
+```
+
+if nt need to be appended,
+1) find the current nt
+2) determine the best nt to append based on outcomes of current nts using ranked codon list
+
+```{r nt-toappend}
+# create storage vectors
+nt_toappend <- vector(length=nrow(peg_library_stops))
+inframe_seq <- vector(length=nrow(peg_library_stops))
+inframe_target <- vector(length=nrow(peg_library_stops))
+inframe_edited_target <- vector(length=nrow(peg_library_stops))
+
+# for each edit...
+for (i in 1:nrow(peg_library_stops)) {
+    # if Number_to_Append == 0...
+    if (peg_library_stops$Number_to_Append[i] == 0) {
+        # store nothing in the appending vector and duplicate the unappended value
+        nt_toappend[i] <- '-'
+        inframe_seq[i] <- peg_library_stops$Start_of_Coding_Seq[i]
+        inframe_target[i] <- peg_library_stops$Minimal_target_sequence[i]
+        inframe_edited_target[i] <- peg_library_stops$Edited_minimal_target[i]
+    } else {
+        # parse the last Number_to_Append nt
+        toappend <- peg_library_stops$Number_to_Append[i]
+        
+        # extract the last 3 - Number_to_Append nt from Start_of_Coding_Seq
+        len <- length(unlist(strsplit(peg_library_stops$Start_of_Coding_Seq[i], '')))
+        endseq <- toupper(substr(peg_library_stops$Start_of_Coding_Seq[i], len-(3-toappend)+1, len))
+        
+        # make a string of '.' to append to fill out the codon
+        if (toappend == 1) {
+            dots <- '.'
+        } else {
+            dots <- '..'
+        }
+        
+        # append dots to make a full codon search term
+        search <- paste0(endseq, dots, collapse='')
+        
+        # match the nt to the first matching possible codon in the ranked codon list
+        df <- codon_ranking[grep(search, codon_ranking$Codon),]
+        match <- df$Codon[1]
+        
+        # parse the last 3 - Number_to_Append of this codon and store
+        if (toappend == 1) {
+            addnt <- toupper(substr(match, 3, 3))
+        } else {
+            addnt <- toupper(substr(match, 2, 3))
+        }
+        nt_toappend[i] <- addnt
+        # concatenate these nt to the end of the sequences and store
+        inframe_seq[i] <- paste0(peg_library_stops$Start_of_Coding_Seq[i], addnt, collapse='')
+        # concatenating to target sequences needs to be done with respect to orientation
+        if (peg_library_stops$Edited_strand[i] == 'sense') {
+            # editing is being done to the sense strand -- just add nt's
+            inframe_target[i] <- paste0(peg_library_stops$Minimal_target_sequence[i], addnt, collapse='')
+            inframe_edited_target[i]  <- paste0(peg_library_stops$Edited_minimal_target[i], addnt, collapse='')
+        } else {
+            # editing is being done to the nonsense strand -- add reverse complement of addnt to  the front of the target sequence
+            addnt_rc <- paste0(toupper(rev(comp(unlist(strsplit(addnt, ''))))), collapse='')
+            # then concatenate and store the un-reverse complement version
+            inframe_target[i] <- paste0(addnt_rc, peg_library_stops$Minimal_target_sequence[i], collapse='')
+            inframe_edited_target[i]  <- paste0(addnt_rc, peg_library_stops$Edited_minimal_target[i], collapse='')
+        }
+    }
+}
+
+# add columns to the dataset
+peg_library_stops <- peg_library_stops %>% mutate(Nt_to_Append = nt_toappend,
+                                                  In_Frame_Coding_Seq = inframe_seq,
+                                                  In_Frame_Minimal_Target = inframe_target,
+                                                  In_Frame_Edited_Minimal_Target = inframe_edited_target)
+```
+
+Generate amino acid sequence 
+
+```{r translate}
+# storage vector for translated sequences
+aa_seqs <- vector(length=nrow(peg_library_stops))
+
+# for each row in peg_library_stops...
+for (i in 1:nrow(peg_library_stops)) {
+    # store the in-frame start of the coding sequence as a DNAstring object
+    dnaseq <- Biostrings::DNAString(peg_library_stops$In_Frame_Coding_Seq[i])
+    
+    # translate the sequence
+    aaseq <- toString(Biostrings::translate(dnaseq))
+    
+    # store the translated sequence
+    aa_seqs[i] <- aaseq
+}
+
+# add amino acid sequence column to peg_library_stops
+peg_library_stops <- peg_library_stops %>% mutate(AA_Sequence = aa_seqs)
+```
+
+```{r add-edits}
+peg_library_stops$Edit_nts <- paste(peg_library_stops$Reference_nt, '>', peg_library_stops$Edited_nt)
+```
+
+```{r export, eval=T}
+# export files
+write.csv(top, 'top_200_edits.csv', row.names=TRUE)
+write.csv(top200_f, 'top_200_forward_templates.csv', row.names=TRUE)
+write.csv(top200_r, 'top_200_reverse_templates.csv', row.names=TRUE)
+write.csv(peg_library, 'MMR-responsive_ATG_edit_candidates.csv', row.names=TRUE)
+```
