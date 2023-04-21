@@ -1,0 +1,513 @@
+---
+title: "Verify Any-ATG Targets and Edits; Assemble Oligonucleotides"
+author: "Katya Williams"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+# 1. Setup
+
+## 1.1 Load necessary libraries
+
+```{r setup}
+# Load any necessary libraries
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(seqinr)
+```
+
+## 1.2 Read in top edit candidate dataset
+
+*This script is designed to verify edits introduced by the AnyATG library design.*
+
+### 1.2.1 Read in AnyATG library dataset
+
+Reads in `MMR-responsive_ATG_edit_candidates.csv`. Set `eval=TRUE` if reading in this library design.
+
+```{r read-anyATG-design, eval=T}
+peg_library_controls <- read_csv('MMR-responsive_ATG_edit_candidates_newdata.csv')
+```
+
+# 2. Oligo Generation
+
+This section generates four oligonucleotides for potential synthesis: 
+ * a single-step assembly design using the wide target sequence
+ * a single-step assembly design using the truncated target sequence
+ * a two-step assembly design using the wide target sequence
+ * a two-step assembly design using the truncated target sequence
+ 
+ In all cases, the target site orientation is inverted with respect to the guide and PBS/RT orientation.
+ 
+Oligos are designed according to Ann Cirincione's `twist_oligo_template_ann_gibson.dna` file, and can be inserted into Ann Ciricione's lentiviral transduction vector pAC025 via Gibson assembly or double digestion with BamHI and BstXI.
+
+## 2.1 Add full oligo sequence columns for 2-step assembly
+ 
+A two-step library assembly process includes  BsmBI restriction cloning sites between the guide and RT template. In the second step of library cloning, these restriction sites will be used to insert a CR1 stem-loop sequence between the guide and RT sequences. Using this oligo design increases the number of lengthy digestion and ligation steps in the library cloning process, but decreases the risk of PCR issues when amplifying the oligos.
+
+## 2.2 Add full oligo sequence columns for 1-step assembly
+
+A one-step library assembly process replaces the BsmBI restriction cloning sites between the guide and RT template with the CR1 stem-loop structure originally intended to be cloned in separately. Using this oligo design reduces the number of lengthy digestion and ligation steps in the library cloning process, but increases the risk of PCR issues when amplifying the oligos, due to secondary structures created by hybridization in the stem-loop structure.
+
+```{r oligo-synth}
+# create more columns
+peg_library_controls <- peg_library_controls %>% mutate(Synthesis_Oligo_truncated_1step=c(),
+                                                        Synthesis_Oligo_truncated_2step=c(),
+                                                        Synthesis_Oligo_wide_1step=c(),
+                                                        Synthesis_Oligo_wide_2step=c())
+
+# store the sequence parts in objects
+startstub <- 'TAAGTATCCCTTGGAGAACCACCTTGTTG'
+stemloop <- 'GTTTAAGAGCTATGCTGGAAACAGCATAGCAAGTTTAAATAAGGCTAGTCCGTTATCAACTTGAAAAAGTGGCACCGAGTCGGTGC'
+BsmBIseqs <- 'GTTTAGAGACGGCATGCCGTCTCGGTGC'
+riboswitchpolyT <- 'CGCGGTTCTATCTAGTTACGCGTTAAACCAACTAGAATTTTTTT'
+endstub <- 'GGATCCAGATCGGAAGAGCACACGTCTG'
+
+# iterate the following over each row
+for (i in 1:nrow(peg_library_controls)) {
+    
+    # generate the reverse compleement of the target
+    mintar_rc <- toupper(paste(rev(comp(unlist(strsplit(peg_library_controls$Minimal_target_sequence[i], '')))), collapse=''))
+    widetar_rc <- toupper(paste(rev(comp(unlist(strsplit(peg_library_controls$Wide_target_sequence[i], '')))), collapse=''))
+    
+    # concatenate the sequences
+    peg_library_controls$Synthesis_Oligo_truncated_1step[i] <- paste0(startstub,
+                                  peg_library_controls$Guide[i], stemloop,
+                                  peg_library_controls$RT_template[i],
+                                  peg_library_controls$PBS[i],
+                                  riboswitchpolyT, peg_library_controls$Barcode[i],
+                                  mintar_rc, endstub)
+    peg_library_controls$Synthesis_Oligo_truncated_2step[i] <- paste0(startstub, 
+                                  peg_library_controls$Guide[i], BsmBIseqs,
+                                  peg_library_controls$RT_template[i],
+                                  peg_library_controls$PBS[i],
+                                  riboswitchpolyT, peg_library_controls$Barcode[i],
+                                  mintar_rc, endstub)
+    peg_library_controls$Synthesis_Oligo_wide_1step[i] <- paste0(startstub, 
+                                  peg_library_controls$Guide[i], stemloop,
+                                  peg_library_controls$RT_template[i],
+                                  peg_library_controls$PBS[i],
+                                  riboswitchpolyT, peg_library_controls$Barcode[i],
+                                  widetar_rc, endstub)
+    peg_library_controls$Synthesis_Oligo_wide_2step[i] <- paste0(startstub, 
+                                  peg_library_controls$Guide[i], BsmBIseqs,
+                                  peg_library_controls$RT_template[i],
+                                  peg_library_controls$PBS[i],
+                                  riboswitchpolyT, peg_library_controls$Barcode[i],
+                                  widetar_rc, endstub)
+}
+```
+
+# 3. Verify edits
+
+## 3.1 Verify target sequence
+
+### 3.1.1 Check that the unmodified minimal target (guide + NGG PAM + RT addition) is present in the wide target sequence
+ * column: `Target_verify`
+    + All values should be `TRUE` (the unmodified minimal target should exactly match a portion of the wide target sequence)
+
+### 3.1.2 Check that the edited target sequence is correct
+
+a) Does the edited target contain ATG in the coding direction?
+ * column: `ATG_verify`, `ATG_verify_wide`
+     + All values should be `TRUE` (every edited target should contain ATG)
+b) Is the ATG in-frame after nucleotides are appended?
+ * column: `InFrame_verify`
+     + All values should be `TRUE` (all ATGs in the edited target sequence should be in-frame after nucleotides are appended)
+
+```{r target-verification}
+# initialize columns
+peg_library_controls <- peg_library_controls %>% mutate(Target_verify=c(), ATG_verify=c(), InFrame_verify=c())
+
+# do all edited targets contain ATG?
+# for each edited target sequence...
+for (i in 1:nrow(peg_library_controls)) {
+    # test for ATG in the truncated target
+    peg_library_controls$ATG_verify[i] <- grepl('ATG', peg_library_controls$In_Frame_Edited_Minimal_Target[i], fixed = TRUE)
+    
+    # test for ATG in the wide target
+    peg_library_controls$ATG_verify_wide[i] <- grepl('ATG', peg_library_controls$Edited_wide_target[i], fixed = TRUE)
+    
+    # check minimal target for match in wide target
+    peg_library_controls$Target_verify[i] <- grepl(peg_library_controls$Minimal_target_sequence[i], peg_library_controls$Wide_target_sequence[i], fixed = TRUE)
+}
+
+# are all ATGs in-frame?
+# for each edited minimal target sequence...
+for (i in 1:nrow(peg_library_controls)) {
+    # if the edit is on the sense strand...
+    if (peg_library_controls$Edited_strand[i] == 'sense') {
+        # split the target into a vector of individual characters
+        split_mintar <- unlist(strsplit(peg_library_controls$In_Frame_Edited_Minimal_Target[i], ''))
+        
+        # find length of target
+        min_len <- length(split_mintar)
+        
+        # find start of ATG
+        ATG_start <- unlist(gregexpr('ATG', peg_library_controls$In_Frame_Edited_Minimal_Target[i], fixed=TRUE))
+        
+        # substring the nt starting with ATG -- this is the coding sequence
+        after_ATG <- substr(peg_library_controls$In_Frame_Edited_Minimal_Target[i], ATG_start, 24)
+    }
+    
+    # if the edit is on the nonsense strand...
+    if (peg_library_controls$Edited_strand[i] == 'nonsense') {
+        # split the target into a vector of individual characters
+        split_mintar <- unlist(strsplit(peg_library_controls$In_Frame_Edited_Minimal_Target[i], ''))
+        
+        # get the reverse complement of the target site (need sense strand)
+        split_mintar_rc <- rev(comp(split_mintar))
+        
+        # concatenate vector to string
+        mintar_rc <- paste0(toupper(split_mintar_rc), collapse='')
+        
+        # find length of target
+        min_len <- length(split_mintar)
+        
+        # find start of ATG
+        ATG_start <- unlist(gregexpr('ATG', mintar_rc, fixed=TRUE))
+        
+        # substring the nt starting with ATG -- this is the coding sequence
+        after_ATG <- substr(mintar_rc, ATG_start, 24)
+    }
+    # subtract end of ATG index from the target length
+    dist_nluc <- min_len - (ATG_start + 2)
+        
+    # find dist_nluc modulo 3 to determine if CAT is in-frame
+    leftover <- dist_nluc %% 3
+    
+    # translate leftover to a true/false value
+    if (leftover == 0) {
+        peg_library_controls$InFrame_verify[i] <- TRUE
+    } else {
+        peg_library_controls$InFrame_verify[i] <- FALSE
+    }
+}
+
+```
+
+## 3.2 Verify PBS, RT binding
+
+### 3.2.1 Verify PBS binding
+Since the target site and RT sequence have been edited, check to make sure the PBSs are compatible with the reverse complement of the target sites
+ * columns: `PBS_verify`, `PBS_verify_wide`
+    + All values should be `TRUE` (the PBS should be fully complementary to a portion of both the edited truncated and wide target sites)
+    
+### 3.2.2 Verify RT binding
+Since the target site and RT sequence have been edited, check to make sure the RTs are compatible with the reverse complement of the target sites  
+ * columns: `RT_verify`, `RT_verify_wide`
+    + All values should be `TRUE` (the RT should be fully complementary to a portion of both the edited truncated and wide target sites)
+
+```{r binding-validate}
+# initialize columns
+peg_library_controls <- peg_library_controls %>% mutate(PBS_verify=c(), RT_verify=c(),
+                                                        PBS_verify_wide=c(), RT_verify_wide=c())
+
+# iterate over each row
+for (i in 1:nrow(peg_library_controls)) {
+    # get rc of minimal in-frame target
+    mintar_rc <- paste(toupper(rev(comp(unlist(strsplit(peg_library_controls$In_Frame_Edited_Minimal_Target[i],''))))), collapse='')
+    widetar_rc <- paste(toupper(rev(comp(unlist(strsplit(peg_library_controls$Edited_wide_target[i],''))))), collapse='')
+    
+    # check PBS for match in the targets
+    peg_library_controls$PBS_verify[i] <- grepl(peg_library_controls$PBS[i], mintar_rc, fixed = TRUE)
+    peg_library_controls$PBS_verify_wide[i] <- grepl(peg_library_controls$PBS[i], widetar_rc, fixed = TRUE)
+    # check RT for match in the targets
+    peg_library_controls$RT_verify[i] <- grepl(peg_library_controls$RT_template[i], mintar_rc, fixed = TRUE)
+    peg_library_controls$RT_verify_wide[i] <- grepl(peg_library_controls$RT_template[i], widetar_rc, fixed = TRUE)
+}
+```
+
+## 3.3 Verify pegRNA
+
+Having confirmed the edited target sequences are correct, check that the pegRNA is correct by using it to generate the edited target sequence
+ * column: `peg_verify`
+    + All values should be` TRUE` (using the edit locus and edited nt information, the code should be able to generate an edited target site using information encoded in the RT, and this target site should exactly match the target site created in a previous script using the edit locus and edited nt information directly)
+
+```{r edit-verification}
+# using pegRNA, regenerate edited minimal target sequence
+for (i in 1:nrow(peg_library_controls)) {
+    # filter out any negative controls
+    if (peg_library_controls$Edit_nts[i] == 'negative_control') {
+        peg_library_controls$peg_verify[i] <- NA
+    } else {
+        index <- as.numeric(peg_library_controls$Edit_position[i])
+        # adjust edit index to target locus
+        adj <- index + 17
+    
+        # take reverse complement of pegRNA RT
+        rt_rc <- toupper(rev(comp(unlist(strsplit(peg_library_controls$RT_template[i], '')))))
+    
+        # split target seq
+        target <- toupper(unlist(strsplit(peg_library_controls$In_Frame_Minimal_Target[i], '')))
+    
+        # for substitution edits: replace nt at index
+        ## parse nt at edit index
+        nt <- rt_rc[index]
+        
+        ## replace nt at edit index
+        target[adj] <- nt
+    
+        # reconcatenate the target sequence into a string and add to column
+        peg_library_controls$Edited_Target_from_pegRNA[i] <- paste0(toupper(target), collapse='')
+    
+        # check to see if this sequence is the same as Edited_Target
+        peg_library_controls$peg_verify[i] <- peg_library_controls$In_Frame_Edited_Minimal_Target[i] == peg_library_controls$Edited_Target_from_pegRNA[i]
+    }
+}
+```
+
+## 3.4 Verify restriction digest compatibility
+
+Ensure the BstXI, BamHI enzymes only have 1 cut site in each oligo; ensure the BsmBI enzyme has only 2 cut sites in the two-step assembly oligos
+
+### 3.4.1 Verify BstXI compatibility
+
+Ensure the BstXI enzyme only has 1 cut site (CCANNNNNNTGG) per oligo
+ * columns: `BstXI_sites_1step`, `BstXI_sites_2step`, `BstXI_sites_wide_1step`, `BstXI_sites_wide_2step`
+    + All values should be `1` (BstXI should have only one cut site in the entire oligo sequence)
+    
+```{r BstXI-verification}
+# check for BstXI cut sites: should only find 1
+peg_library_controls <- peg_library_controls %>% 
+    mutate(BstXI_sites_1step = sapply(gregexpr("CCA......TGG", Synthesis_Oligo_truncated_1step),
+                        function(x) if( x[1]==-1 ){ 0 }else{ length(x) } ))
+peg_library_controls <- peg_library_controls %>% 
+    mutate(BstXI_sites_2step = sapply(gregexpr("CCA......TGG", Synthesis_Oligo_truncated_2step),
+                        function(x) if( x[1]==-1 ){ 0 }else{ length(x) } ))
+peg_library_controls <- peg_library_controls %>% 
+    mutate(BstXI_sites_wide_1step = sapply(gregexpr("CCA......TGG", Synthesis_Oligo_wide_1step),
+                        function(x) if( x[1]==-1 ){ 0 }else{ length(x) } ))
+peg_library_controls <- peg_library_controls %>% 
+    mutate(BstXI_sites_wide_2step = sapply(gregexpr("CCA......TGG", Synthesis_Oligo_wide_2step),
+                        function(x) if( x[1]==-1 ){ 0 }else{ length(x) } ))
+```
+
+### 3.4.2 Verify BamHI compatibility
+
+Ensure the BamHI enzyme only has 1 cut site (GGATCC) per oligo
+ * columns: `BamHI_sites_1step`, `BamHI_sites_2step`, `BamHI_sites_wide_1step`, `BamHI_sites_wide_2step`
+    + All values should be `1` (BamHI should have only one cut site in the entire oligo sequence)
+
+```{r BamHI-verification}
+# check for BstXI cut sites: should only find 1
+peg_library_controls <- peg_library_controls %>% 
+    mutate(BamHI_sites_1step = sapply(gregexpr("GGATCC", Synthesis_Oligo_truncated_1step),
+                        function(x) if( x[1]==-1 ){ 0 }else{ length(x) } ))
+peg_library_controls <- peg_library_controls %>% 
+    mutate(BamHI_sites_2step = sapply(gregexpr("GGATCC", Synthesis_Oligo_truncated_2step),
+                        function(x) if( x[1]==-1 ){ 0 }else{ length(x) } ))
+peg_library_controls <- peg_library_controls %>% 
+    mutate(BamHI_sites_wide_1step = sapply(gregexpr("GGATCC", Synthesis_Oligo_wide_1step),
+                        function(x) if( x[1]==-1 ){ 0 }else{ length(x) } ))
+peg_library_controls <- peg_library_controls %>% 
+    mutate(BamHI_sites_wide_2step = sapply(gregexpr("GGATCC", Synthesis_Oligo_wide_2step),
+                        function(x) if( x[1]==-1 ){ 0 }else{ length(x) } ))
+```
+
+### 3.4.3 Verify BsmBI compatibility (2-step oligos only)
+
+Ensure the BsmBI enzyme has only 2 cut sites (either CGTCTC or GAGACG) per 2-step assembly oligo
+ * columns: `BsmBI_sites_2step`, `BsmBI_sites_wide_2step`
+    + All values should be `2` (BamHI should have only one cut site in the entire oligo sequence)
+
+```{r BsmBI-verification}
+# check for BsmBI cut sites: should only find 2
+## 2-step assembly only
+peg_library_controls <- peg_library_controls %>% 
+    mutate(BsmBI_sites_2step = sapply(gregexpr("CGTCTC", Synthesis_Oligo_truncated_2step),
+                        function(x) if( x[1]==-1 ){ 0 }else{ length(x) } ) + 
+                               sapply(gregexpr("GAGACG", Synthesis_Oligo_truncated_2step),
+                        function(x) if( x[1]==-1 ){ 0 }else{ length(x) } ))
+peg_library_controls <- peg_library_controls %>% 
+    mutate(BsmBI_sites_wide_2step = sapply(gregexpr("CGTCTC", Synthesis_Oligo_wide_2step),
+                        function(x) if( x[1]==-1 ){ 0 }else{ length(x) } ) + 
+                               sapply(gregexpr("GAGACG", Synthesis_Oligo_wide_2step),
+                        function(x) if( x[1]==-1 ){ 0 }else{ length(x) } ))
+```
+
+# 4. Export data
+
+## 4.1 Create and export synthesis format datasets and accompanying FASTA files
+
+Create synthesis datasets: only contain columns necessary for oligo assembly
+
+Simultaneously generate FASTA files to use to build a Bowtie2 index (for later sequencing alignments)
+
+*To minimize file clutter, only set `eval=TRUE` for the set of oligos and accompanying FASTA files you intend to send for synthesis.*
+
+### 4.1.1 Export oligos, FASTA files for single-step assembly using the wide target
+
+*Modify the directory name stored in `dir` to best describe your library. Retaining "FASTA_1step_wide" in the name is recommended.*
+
+```{r 1step-wide-synth-set, eval=T}
+# store the custom directory name
+dir <- 'FASTA_1step_wide'
+
+# if a storage directory for this data does not already exist, make one
+if (dir.exists(dir) == FALSE) {
+    dir.create(dir)
+    dirfiles <- paste0(dir, '/fastafiles')
+    dir.create(dirfiles)
+}
+
+# create the synthesis dataset
+synth_1step_wide <- tibble(Name = peg_library_controls$pegRNA_ID,
+                Sequence = peg_library_controls$Synthesis_Oligo_wide_1step)
+
+# export the synthesis dataset
+write.csv(synth_1step_wide, 'synth_1step_wide.csv', row.names=TRUE)
+
+# export individual fasta files to their own folder
+csl <- ' '
+
+for (i in 1:nrow(synth_1step_wide)) {
+    seq <- synth_1step_wide$Sequence[i]
+    name <- synth_1step_wide$Name[i]
+    file <- paste0('FASTA_1step_wide/fastafiles/', name, '.txt')
+    
+    write.fasta(seq, name, file, 
+                open = "w", nbchar = 60, as.string = FALSE)
+    csl <- paste0(csl, ',', name, '.txt')
+}
+
+dircsv <- paste0(dir, '/fastanames.txt')
+
+fasta_1step_wide <- file(dircsv)
+writeLines(c(csl), fasta_1step_wide)
+close(fasta_1step_wide)
+```
+
+### 4.1.2 Export oligos for single-step assembly using the truncated target
+
+*Modify the directory name stored in `dir` to best describe your library. Retaining "FASTA_1step_truncated" in the name is recommended.*
+
+```{r 1step-truncated-synth-set, eval=F}
+# store the custom directory name
+dir <- 'FASTA_1step_truncated'
+
+# if a storage directory for this data does not already exist, make one
+if (dir.exists(dir) == FALSE) {
+    dir.create(dir)
+    dirfiles <- paste0(dir, '/fastafiles')
+    dir.create(dirfiles)
+}
+
+# create the synthesis dataset
+synth_1step_truncated <- tibble(Name = peg_library_controls$pegRNA_ID,
+                Sequence = peg_library_controls$Synthesis_Oligo_truncated_1step)
+
+# export the synthesis dataset
+write.csv(synth_1step_truncated, 'synth_1step_truncated.csv', row.names=TRUE)
+
+# export individual fasta files to their own folder
+csl <- ' '
+
+for (i in 1:nrow(synth_1step_truncated)) {
+    seq <- synth_1step_truncated$Sequence[i]
+    name <- synth_1step_truncated$Name[i]
+    file <- paste0('FASTA_1step_truncated/fastafiles/', name, '.txt')
+    
+    write.fasta(seq, name, file, 
+                open = "w", nbchar = 60, as.string = FALSE)
+    csl <- paste0(csl, ',', name, '.txt')
+}
+
+dircsv <- paste0(dir, '/fastanames.txt')
+
+# create a comma-separated list of all the fasta files
+fasta_1step_truncated <- file(dircsv)
+writeLines(c(csl), fasta_1step_truncated)
+close(fasta_1step_truncated)
+```
+
+### 4.1.3 Export oligos for two-step assembly using the wide target
+
+*Modify the directory name stored in `dir` to best describe your library. Retaining "FASTA_2step_wide" in the name is recommended.*
+
+```{r 2step-wide-synth-set, eval=F}
+# store the custom directory name
+dir <- 'FASTA_2step_wide'
+
+# if a storage directory for this data does not already exist, make one
+if (dir.exists(dir) == FALSE) {
+    dir.create(dir)
+    dirfiles <- paste0(dir, '/fastafiles')
+    dir.create(dirfiles)
+}
+
+# create the synthesis dataset
+synth_2step_wide <- tibble(Name = peg_library_controls$pegRNA_ID,
+                Sequence = peg_library_controls$Synthesis_Oligo_wide_2step)
+
+# export the synthesis dataset
+write.csv(synth_2step_wide, 'synth_2step_wide.csv', row.names=TRUE)
+
+# export individual fasta files to their own folder
+csl <- ' '
+
+for (i in 1:nrow(synth_2step_wide)) {
+    seq <- synth_2step_wide$Sequence[i]
+    name <- synth_2step_wide$Name[i]
+    file <- paste0('FASTA_2step_wide/fastafiles/', name, '.txt')
+    
+    write.fasta(seq, name, file, 
+                open = "w", nbchar = 60, as.string = FALSE)
+    csl <- paste0(csl, ',', name, '.txt')
+}
+
+dircsv <- paste0(dir, '/fastanames.txt')
+
+fasta_2step_wide <- file(dircsv)
+writeLines(c(csl), fasta_2step_wide)
+close(fasta_2step_wide)
+```
+
+### 4.1.4 Export oligos for two-step assembly using the truncated target
+
+*Modify the directory name stored in `dir` to best describe your library. Retaining "FASTA_2step_truncated" in the name is recommended.*
+
+```{r 2step-truncated-synth-set, eval=F}
+# store the custom directory name
+dir <- 'FASTA_2step_truncated'
+
+# if a storage directory for this data does not already exist, make one
+if (dir.exists(dir) == FALSE) {
+    dir.create(dir)
+    dirfiles <- paste0(dir, '/fastafiles')
+    dir.create(dirfiles)
+}
+
+# create the synthesis dataset
+synth_2step_truncated <- tibble(Name = peg_library_controls$pegRNA_ID,
+                Sequence = peg_library_controls$Synthesis_Oligo_truncated_2step)
+
+# export the synthesis dataset
+write.csv(synth_2step_truncated, 'synth_2step_truncated.csv', row.names=TRUE)
+
+# export individual fasta files to their own folder
+csl <- ' '
+
+for (i in 1:nrow(synth_2step_truncated)) {
+    seq <- synth_2step_truncated$Sequence[i]
+    name <- synth_2step_truncated$Name[i]
+    file <- paste0('FASTA_2step_truncated/fastafiles/', name, '.txt')
+    
+    write.fasta(seq, name, file, 
+                open = "w", nbchar = 60, as.string = FALSE)
+    csl <- paste0(csl, ',', name, '.txt')
+}
+
+dircsv <- paste0(dir, '/fastanames.txt')
+
+# create a comma-separated list of all the fasta files
+fasta_2step_truncated <- file(dircsv)
+writeLines(c(csl), fasta_2step_truncated)
+close(fasta_2step_truncated)
+```
+
+## 4.2 Update the edit information dataset to include control validations
+
+```{r export}
+# export files
+write.csv(peg_library_controls, 'MMR-responsive_+5GtoT_edit_candidates.csv', row.names=TRUE)
+```
