@@ -1,0 +1,169 @@
+---
+title: "Select Top *n* +5 G to T Compatible Target Loci from lDS_004"
+author: "Katya Williams"
+date: '`r Sys.Date()`'
+output: html_document
+---
+
+# 1. Setup
+
+## 1.1 Load necessary libraries
+
+```{r setup}
+# Load any necessary libraries
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(seqinr)
+```
+
+## 1.2 Read in lDS004 datasets
+
+```{r read-lDS004}
+# read in lDS004 data (from Ann Cirincione)
+lds004 <- read_csv("lDS004_only_d7.csv")          # contains info on the edit
+lds004_avg <- read_csv('lDS004_avg_outcomes.csv') # contains editing percentages
+
+# select relevant columns
+selected <- lds004 %>% select(pegRNA_ID, cell_line, Gene, Guide, PBS, RT_template, Barcode,
+                              Wide_target_sequence, Reference_nt, Edited_nt, Protospacer,
+                              PBS_length, RT_length, GC_percent_PBS)
+selected_avg <- lds004_avg %>% select(pegID, CellLine, Day7.Avg.Freq.TotalEdited,
+                                      Day7.Avg.Freq.EditOnly, Day7.Avg.Freq.TotalErrors,
+                                      Day7.Avg.TotalReads)
+```
+
+## 1.3 Read in any auxiliary datasets
+
+```{r read-aux}
+# read in list of essential genes from depmap and set up data for use
+## 'common_essentials.csv' from depmap.org
+essential <- read_csv('common_essentials.csv')
+essential <- essential %>% separate(gene, into = c("gene", "num"), sep = "\\s")
+```
+
+# 2. MMR filtering
+
+## 2.1 Rank by sensitivity to MMR loss
+
+```{r MMR-rank}
+# set up data to create separate cell line columns for editing percentages
+## arrange so that biggest group is gene, next biggest group is edited nt, smallest group is cell line
+sort <- selected %>% arrange(cell_line) %>% arrange(Edited_nt) %>% arrange(Gene)
+## group 004_avg by pegID
+sort_avg <- selected_avg %>% arrange(pegID)
+
+# generate editing difference between WT and MMR KO
+## create new sets, one for each cell line
+mlh1 <- sort %>% filter(cell_line == 'MLH1_KO')
+pemax <- sort %>% filter(cell_line == 'PEmax')
+mlh1_avg <- sort_avg %>% filter(CellLine == 'MLH1_KO')
+pemax_avg <- sort_avg %>% filter(CellLine == 'PEMax')
+
+## join back together by pegRNA ID
+wide <- right_join(mlh1, pemax, by=c('pegRNA_ID' = 'pegRNA_ID'))
+wide_avg <- right_join(mlh1_avg, pemax_avg, by=c('pegID' = 'pegID'))
+
+## give columns more meaningful names
+wide <- wide %>% rename(Gene = Gene.x, Guide = Guide.x, PBS = PBS.x, 
+                        RT_template = RT_template.x, Barcode = Barcode.x,
+                        Wide_target_sequence = Wide_target_sequence.x, 
+                        Reference_nt = Reference_nt.x, Edited_nt = Edited_nt.x, 
+                        PBS_length = PBS_length.x, RT_length = RT_length.x, 
+                        GC_percent_PBS = GC_percent_PBS.x, Protospacer = Protospacer.x)
+wide_avg <- wide_avg %>% rename(MLH1_Avg_Freq_TotalEdited_d7 = Day7.Avg.Freq.TotalEdited.x, 
+                                PEmax_Avg_Freq_TotalEdited_d7 = Day7.Avg.Freq.TotalEdited.y,
+                                MLH1_Avg_Freq_EditOnly_d7 = Day7.Avg.Freq.EditOnly.x, 
+                                PEmax_Avg_Freq_EditOnly_d7 = Day7.Avg.Freq.EditOnly.y, 
+                                MLH1_Avg_Freq_TotalErrors = Day7.Avg.Freq.TotalErrors.x, 
+                                PEmax_Avg_Freq_TotalErrors = Day7.Avg.Freq.TotalErrors.y,
+                                MLH1_Avg_TotalReads = Day7.Avg.TotalReads.x, 
+                                PEmax_Avg_TotalReads = Day7.Avg.TotalReads.y)
+
+# keep only the important columns in wide, wide_avg
+wide <- wide %>% select(pegRNA_ID, Gene, Guide, PBS, RT_template, Barcode, Wide_target_sequence,
+                        Reference_nt, Edited_nt, PBS_length, RT_length,
+                        GC_percent_PBS, Protospacer)
+wide_avg <- wide_avg %>% select(pegID = pegID, 
+                                MLH1_Avg_Freq_TotalEdited_d7, PEmax_Avg_Freq_TotalEdited_d7,
+                                MLH1_Avg_Freq_EditOnly_d7, PEmax_Avg_Freq_EditOnly_d7, 
+                                MLH1_Avg_Freq_TotalErrors, PEmax_Avg_Freq_TotalErrors,
+                                MLH1_Avg_TotalReads, PEmax_Avg_TotalReads)
+
+## calculate the difference and proportion in editing percentage by cell line
+wide_avg <- wide_avg %>% mutate(mean_diff_avg_freq = MLH1_Avg_Freq_EditOnly_d7 - PEmax_Avg_Freq_EditOnly_d7)
+
+# join data together by pegRNA ID
+diff <- full_join(wide, wide_avg, by=c('pegRNA_ID' = 'pegID'))
+```
+
+## 2.2 Remove negative controls and essential genes
+
+Since the pegRNA will edit the gene in its original context, ensure the pegRNA will not modify genes with essential functions -- this will give us a better estimate of editing efficacy since cells will be less likely to die as a direct result of editing.
+
+```{r remove-essential}
+# remove unhelpful data
+## filter out any non-targeting rows
+diff <- diff[!grepl('non-targeting', diff$Gene),]
+
+# remove any essential genes
+## uses essential genes dataset read in in 1.3
+diff <- diff %>% filter(!Gene %in% essential$gene)
+```
+
+## 2.3 Rank MMR sensitivity by approximating the maximum difference between MLH1 KO and PEmax efficiencies
+
+```{r model}
+# create a model to use to approximate max difference between MLH1 KO and PEmax
+## fit the model
+model <- loess(diff$MLH1_Avg_Freq_EditOnly_d7 ~ diff$PEmax_Avg_Freq_EditOnly_d7, na.action=na.exclude)
+
+## store the predicted MLH1 KO alue for each PEmax value per row
+prediction <- predict(model)
+
+## find the residuals and store, then arrange by smallest residuals first
+diff <- diff %>% mutate(Residuals = diff$MLH1_Avg_Freq_EditOnly_d7 - prediction) %>% 
+    arrange(Residuals)
+```
+
+## 2.4 Select number of edits
+
+*Modify edit tuning parameters min_MLH1, max_PEmax to change edit selection number*
+
+```{r tuning-parameters}
+# tuning parameters for selection
+## number of edit candidates to work with: change to optimize library size (Tier 1: end goal of max 100)
+## minimum threshold for MLH1 KO efficiency
+## maximum threshold for PEmax WT efficiency
+min_MLH1 <- 0.6863 # adjusting up decreases library size
+max_PEmax <- 0.094 # adjusting down decreases library size
+```
+
+```{r top-from-diff-avg}
+# remove any duplicate entries
+## create a row identifier of gene + target locus (creates a duplicate gene column, which we then need to remove)
+diff <- diff %>% separate(pegRNA_ID, into = c("gene", "Gene_Locus"), sep = "_", extra='drop') %>%
+    select(-gene) %>% mutate(Target_Locus = paste(Gene, Gene_Locus, sep="_"))
+nrow(diff)
+## remove any duplicate entries under Target_Locus
+diff <- diff %>%  filter(Edited_nt == 'T')
+nrow(diff)
+
+# select n edit candidates by first filtering for edits within the thresholds, then ordering by smallest residual
+top <- diff %>% filter(MLH1_Avg_Freq_EditOnly_d7 >= min_MLH1) %>% 
+    filter(PEmax_Avg_Freq_EditOnly_d7 <= max_PEmax) %>% 
+    arrange(Residuals) 
+```
+
+# 3. Export data
+
+## 3.1 Export target loci data
+
+```{r export}
+# export files
+write.csv(top, 'MMR-responsive_+5GtoT_target_candidates.csv', row.names=TRUE)
+```
+
+## 3.2 Export Ann's joined datasets, with PEmax vs MLH1KO difference
+
+```{r export diff}
+write.csv(diff, 'lDS004_joined_+5GtoT_mean.csv', row.names=TRUE)
